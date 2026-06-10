@@ -117,31 +117,33 @@ void calcRPM() {
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
+// Yellow zone: y 0-15  Blue zone: y 16-63
 void drawDisplay(const char *label) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
+  // Yellow zone — status + target RPM
   display.setTextSize(1);
-  display.setCursor(0, 0);
+  display.setCursor(0, 4);
   display.print(label);
-
-  display.setTextSize(2);
-  display.setCursor(0, 14);
-  display.print((int)rpm);
-  display.print("/");
+  display.setCursor(80, 4);
+  display.print(">");
   display.print(targetRPM);
-  display.println(" RPM");
+  display.print(" RPM");
 
+  // Blue zone — current RPM big
+  display.setTextSize(3);
+  display.setCursor(0, 18);
+  display.print((int)rpm);
+
+  // PWM bar bottom
   display.setTextSize(1);
-  display.setCursor(0, 38);
-  display.print("PWM: ");
+  display.setCursor(0, 52);
+  display.print("PWM:");
   display.print(currentPWM);
-  int barW = map(currentPWM, 0, 255, 0, 100);
-  display.fillRect(0, 48, barW, 8, SSD1306_WHITE);
-  display.drawRect(0, 48, 100, 8, SSD1306_WHITE);
-
-  display.setCursor(110, 0);
-  display.print("+/-");
+  int barW = map(currentPWM, 0, 255, 0, 75);
+  display.fillRect(50, 54, barW, 6, SSD1306_WHITE);
+  display.drawRect(50, 54, 75, 6, SSD1306_WHITE);
 
   display.display();
 }
@@ -169,10 +171,15 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  // Yellow zone
+  display.setCursor(0, 4);
+  display.print("COFFEE GRINDER");
+  // Blue zone
+  display.setTextSize(2);
   display.setCursor(0, 20);
-  display.println("Coffee Grinder");
-  display.println("Press START");
+  display.print("Starting..");
   display.display();
+  delay(1500);
 
   pidSetpoint = targetRPM;
   grindPID.SetMode(AUTOMATIC);
@@ -180,6 +187,11 @@ void setup() {
   grindPID.SetSampleTime(RPM_CALC_MS);
 
   lastRpmCalc = millis();
+
+  // Auto-start (no buttons yet)
+  pulseCount = 0;
+  rampTo(80);
+  state = GRINDING;
 }
 
 // ── Loop ─────────────────────────────────────────────────────────────────────
