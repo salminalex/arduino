@@ -2,122 +2,94 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-#define OLED_CS    8
-#define OLED_DC    9
-#define OLED_RESET 10
+#define BTN_START   A3
+#define BTN_MINUS   A2
+#define BTN_PLUS    A4
+#define LED_START   10
+#define LED_PLUSMIN  9
 
-#define RPWM 5
-#define LPWM 6
-#define R_EN 4
-#define L_EN 7
+#define OLED_MOSI  11
+#define OLED_CLK   13
+#define OLED_DC    A5
+#define OLED_CS    12
+#define OLED_RESET  8
 
-#define ENCODER_A 2
-#define ENCODER_B 3
+Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
-#define GEAR_RATIO     51.0
-#define PULSES_PER_REV 16.0
+int value = 0;
 
-volatile long pulses = 0;
-unsigned long lastTime = 0;
-float rpm = 0;
-int currentPWM = 0;
-bool running = false;
+struct Button {
+  uint8_t pin;
+  bool    last;
+  unsigned long lastMs;
+};
 
-Adafruit_SSD1306 display(128, 64, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+Button bStart = {BTN_START, HIGH, 0};
+Button bPlus  = {BTN_PLUS,  HIGH, 0};
+Button bMinus = {BTN_MINUS, HIGH, 0};
 
-void countPulse() { pulses++; }
+bool pressed(Button &b) {
+  bool now = digitalRead(b.pin);
+  bool hit = (now == LOW && b.last == HIGH && millis() - b.lastMs > 50);
+  if (hit) b.lastMs = millis();
+  b.last = now;
+  return hit;
+}
 
-void showStatus(const char* status, float rpm, int pwm) {
+void draw() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Yellow zone: status
   display.setTextSize(1);
   display.setCursor(0, 4);
-  display.print(status);
+  display.print("VALUE");
 
-  // Blue zone: RPM big
-  display.setTextSize(3);
-  display.setCursor(0, 18);
-  display.print((int)rpm);
+  display.setTextSize(4);
+  display.setCursor(0, 24);
+  display.print(value);
 
-  // PWM bottom
   display.setTextSize(1);
-  display.setCursor(0, 52);
-  display.print("PWM: ");
-  display.print(pwm);
+  display.setCursor(0, 56);
+  display.print("START = reset");
 
   display.display();
 }
 
-void calcRPM() {
-  unsigned long now = millis();
-  if (now - lastTime >= 300) {
-    noInterrupts();
-    long p = pulses;
-    pulses = 0;
-    interrupts();
-    rpm = (p / PULSES_PER_REV) / ((now - lastTime) / 60000.0) / GEAR_RATIO;
-    lastTime = now;
-  }
-}
+unsigned long flashUntil = 0;
+int flashPin = LED_START;
 
-void rampTo(int pin, int from, int to, const char* label) {
-  int step = (to > from) ? 3 : -3;
-  for (int i = from; (step > 0) ? (i <= to) : (i >= to); i += step) {
-    analogWrite(pin, i);
-    currentPWM = i;
-    calcRPM();
-    showStatus(label, rpm, i);
-    delay(20);
-  }
-  currentPWM = to;
+void flash(int pin) {
+  flashPin   = pin;
+  flashUntil = millis() + 150;
 }
 
 void setup() {
-  Serial.begin(9600);
-
-  pinMode(RPWM, OUTPUT);
-  pinMode(LPWM, OUTPUT);
-  pinMode(R_EN, OUTPUT);
-  pinMode(L_EN, OUTPUT);
-  pinMode(ENCODER_A, INPUT_PULLUP);
-  pinMode(ENCODER_B, INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A), countPulse, RISING);
+  pinMode(BTN_START,   INPUT_PULLUP);
+  pinMode(BTN_PLUS,    INPUT_PULLUP);
+  pinMode(BTN_MINUS,   INPUT_PULLUP);
+  pinMode(LED_START,   OUTPUT);
+  pinMode(LED_PLUSMIN, OUTPUT);
 
   display.begin(SSD1306_SWITCHCAPVCC);
-  digitalWrite(R_EN, HIGH);
-  digitalWrite(L_EN, HIGH);
-  lastTime = millis();
-
-  showStatus("READY", 0, 0);
+  draw();
 }
 
 void loop() {
-  // Forward
-  rampTo(RPWM, 0, 255, "ACCEL");
-  for (int i = 0; i < 20; i++) {
-    calcRPM();
-    showStatus("FORWARD", rpm, currentPWM);
-    Serial.print("RPM: ");
-    Serial.println(rpm);
-    delay(100);
-  }
-  rampTo(RPWM, 255, 0, "BRAKE");
-  showStatus("STOP", 0, 0);
-  delay(1000);
+  bool changed = false;
 
-  // Reverse
-  rampTo(LPWM, 0, 255, "ACCEL");
-  for (int i = 0; i < 20; i++) {
-    calcRPM();
-    showStatus("REVERSE", rpm, currentPWM);
-    Serial.print("RPM: ");
-    Serial.println(rpm);
-    delay(100);
+  if (pressed(bPlus))  { value++;   flash(LED_PLUSMIN); changed = true; }
+  if (pressed(bMinus)) { value--;   flash(LED_PLUSMIN); changed = true; }
+  if (pressed(bStart)) { value = 0; flash(LED_START);   changed = true; }
+
+  if (changed) draw();
+
+  if (millis() < flashUntil) {
+    analogWrite(flashPin, 255);
+    analogWrite(flashPin == LED_START ? LED_PLUSMIN : LED_START, 40);
+  } else {
+    analogWrite(LED_START,   40);
+    analogWrite(LED_PLUSMIN, 40);
   }
-  rampTo(LPWM, 255, 0, "BRAKE");
-  showStatus("STOP", 0, 0);
-  delay(1000);
+
+  delay(10);
 }
