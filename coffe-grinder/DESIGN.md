@@ -313,8 +313,26 @@ Condition: **`rpm < 30% of target` AND `PWM > 200`, held for 300 ms.**
   cooks both itself and the driver. For beans-empty, 1.5 s is right because the
   cost of a mistake is only an unfinished dose. For a jam the cost is hardware.
 
-Response: short reverse pulse, pause, forward again, up to 3 attempts, then hard
-stop with a message.
+Response, as built (`ST_UNJAM`): stop the motor, wait 150 ms of dead time, drive
+backwards at PWM 150 for 400 ms, coast 200 ms, then decide from the encoder.
+Turned during the pulse (rpm > 25) — go back to grinding; did not — retry with
+40 more PWM, up to 3 attempts, then `ST_JAM` and a manual reset. START aborts at
+any point. Reverse was validated on 2026-08-16 with a single pulse from IDLE in a
+throwaway build, not by jamming the grinder on purpose.
+
+Three details that are easy to get wrong:
+
+- **Dead time before reversing.** Never cross-drive the bridge. Both PWM pins go
+  to 0 and stay there for 150 ms so the current in the winding decays before the
+  other half turns on.
+- **Resume, do not restart.** A recovered jam returns to grinding with elapsed
+  time, load plateau and the `armed` flag intact. Calling the normal grinding
+  entry instead would zero the plateau, and auto-stop would lose the baseline it
+  needs — the next load drop would read as beans-empty and end the dose early.
+- **Freeze the load EMA while reversing.** Current is sensed on `R_IS`, the
+  forward half of the bridge, so it reads near zero during a reverse pulse. Left
+  running, the EMA would decay to almost nothing over the ~750 ms sequence and
+  trip the beans-empty test right after resuming.
 
 Current is a third voice here, used to **tell a jam apart from a broken encoder
 wire**. Both look identical (rpm 0 at high PWM), but a jam spikes the current
@@ -382,8 +400,9 @@ on purpose to measure it is not worth the risk, so reverse gets validated with a
 short low-PWM pulse while the jam recovery is being written.
 
 Firmware built and verified on hardware since: the state machine (IDLE /
-GRINDING / JAM / DONE), auto-stop on the beans-empty plateau drop, target rpm
-persisted in EEPROM, and power-down sleep with wake on START.
+GRINDING / UNJAM / JAM / DONE), auto-stop on the beans-empty plateau drop, target
+rpm persisted in EEPROM, power-down sleep with wake on START, and jam recovery by
+reverse pulse. A real 5 g dose has been ground end to end on this firmware.
 
 Sleep details: `SLEEP_MODE_PWR_DOWN` entered after `SLEEP_MS` idle, woken by
 PCINT11 on A3 (START). The ADC is switched off before sleeping and restored
@@ -393,9 +412,9 @@ every timer is re-based on wake. The ISR body is empty — waking is the point.
 
 **Sleep timeout is 60 s** (tested at 20 s, 5 min judged too long in use).
 
-Next: jam reverse recovery, burr mileage and shot counters in EEPROM, settings
-and diagnostics screen (baseline, plateau, threshold, live current), cleaning
-reminder.
+Next: burr mileage and shot counters in EEPROM, settings and diagnostics screen
+(baseline, plateau, threshold, live current), cleaning reminder, and the torque
+limit of 5.5, which is still unhandled.
 
 Open decisions: which settings are editable beyond target rpm, cleaning reminder
 threshold.

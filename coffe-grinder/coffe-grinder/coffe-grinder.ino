@@ -53,6 +53,14 @@ using namespace ace_button;
 #define JAM_MS      300
 #define START_GRACE 1500
 
+#define UNJAM_PWM     150
+#define UNJAM_BOOST    40
+#define UNJAM_MS      400
+#define UNJAM_PAUSE   200
+#define UNJAM_DEAD    150
+#define UNJAM_TRIES     3
+#define UNJAM_RPM_OK   25
+
 #define DONE_MS    2000
 #define LOAD_SPAN   200
 
@@ -68,7 +76,7 @@ using namespace ace_button;
 
 #define SLEEP_MS   60000UL
 
-enum State { ST_IDLE, ST_GRINDING, ST_JAM, ST_DONE };
+enum State { ST_IDLE, ST_GRINDING, ST_UNJAM, ST_JAM, ST_DONE };
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
@@ -91,6 +99,8 @@ int plateau   = 0;
 bool armed      = false;
 bool autoStop   = false;
 bool eeDirty    = false;
+bool unjamSpun  = false;
+byte unjamTry   = 0;
 
 unsigned long tEmptyFrom = 0;
 unsigned long tEeChange  = 0;
@@ -165,11 +175,18 @@ void enter(State s) {
       loadEMA  = 0;
       armed    = false;
       autoStop = false;
+      unjamTry = 0;
       if (eeDirty) saveSettings();
       noInterrupts();
       pulses = 0;
       interrupts();
       tSample = millis();
+      break;
+    case ST_UNJAM:
+      motorStop();
+      unjamSpun = false;
+      unjamTry++;
+      rpm = 0;
       break;
     case ST_JAM:
       motorStop();
@@ -181,8 +198,48 @@ void enter(State s) {
       motorStop();
       rpm  = 0;
       load = 0;
+      unjamTry = 0;
       break;
   }
+}
+
+void resumeGrinding() {
+  state    = ST_GRINDING;
+  tState   = millis() - grindMs;
+  integral = 0;
+  pwmWant  = 0;
+  pwmNow   = 0;
+  tJamFrom = 0;
+  tEmptyFrom = 0;
+  noInterrupts();
+  pulses = 0;
+  interrupts();
+  tSample = millis();
+}
+
+int unjamPwm() {
+  return constrain(UNJAM_PWM + (unjamTry - 1) * UNJAM_BOOST, 0, 240);
+}
+
+void unjamStep() {
+  if (state != ST_UNJAM) return;
+  unsigned long el = millis() - tState;
+
+  if (el < UNJAM_DEAD) return;
+
+  if (el < UNJAM_DEAD + UNJAM_MS) {
+    analogWrite(RPWM, 0);
+    analogWrite(LPWM, unjamPwm());
+    if (rpm > UNJAM_RPM_OK) unjamSpun = true;
+    return;
+  }
+
+  analogWrite(LPWM, 0);
+  if (el < UNJAM_DEAD + UNJAM_MS + UNJAM_PAUSE) return;
+
+  if (unjamSpun)                 resumeGrinding();
+  else if (unjamTry < UNJAM_TRIES) enter(ST_UNJAM);
+  else                             enter(ST_JAM);
 }
 
 void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
@@ -215,12 +272,15 @@ void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
         enter(ST_DONE);
       }
       else if (state == ST_JAM)   enter(ST_IDLE);
+      else if (state == ST_UNJAM) enter(ST_IDLE);
       else if (state == ST_IDLE)  enter(ST_GRINDING);
       break;
   }
 }
 
 void applyRamp() {
+  if (state == ST_UNJAM) return;
+
   unsigned long now = millis();
   if (now - tRamp < 15) return;
   tRamp = now;
@@ -249,7 +309,7 @@ void controlStep() {
   rpm     = ((long)p * 60000L) / ((long)dt * PULSES_PER_REV * GEAR_RATIO);
   current = readCurrent();
   load    = constrain(current - idleAt(pwmNow), 0, LOAD_SPAN);
-  loadEMA = (loadEMA * 7 + load * 3) / 10;
+  if (state != ST_UNJAM) loadEMA = (loadEMA * 7 + load * 3) / 10;
 
   if (state != ST_GRINDING) return;
 
@@ -265,7 +325,7 @@ void controlStep() {
 
   if (rpm < (targetRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
     if (tJamFrom == 0) tJamFrom = now;
-    else if (now - tJamFrom > JAM_MS) { enter(ST_JAM); return; }
+    else if (now - tJamFrom > JAM_MS) { enter(ST_UNJAM); return; }
   } else {
     tJamFrom = 0;
   }
@@ -355,12 +415,27 @@ void draw() {
   switch (state) {
     case ST_IDLE:     display.print(F("READY")); break;
     case ST_GRINDING: display.print(grindMs / 1000); display.print(F("s")); break;
+    case ST_UNJAM:    display.print(F("REV ")); display.print(unjamTry); break;
     case ST_JAM:      display.print(F("JAM")); break;
     case ST_DONE:
       display.print(autoStop ? F("AUTO ") : F("STOP "));
       display.print(doseMs / 1000);
       display.print(F("s"));
       break;
+  }
+
+  if (state == ST_UNJAM) {
+    display.setTextSize(2);
+    display.setCursor(0, 26);
+    display.print(F("REVERSE"));
+    display.setTextSize(1);
+    display.setCursor(0, 54);
+    display.print(F("clearing "));
+    display.print(unjamTry);
+    display.print('/');
+    display.print(UNJAM_TRIES);
+    display.display();
+    return;
   }
 
   if (state == ST_JAM) {
@@ -403,6 +478,7 @@ void updateLeds() {
   int b = 40;
 
   if (state == ST_GRINDING) b = 40 + 160 * (1 + sin(now / 250.0)) / 2;
+  else if (state == ST_UNJAM) b = (now / 100) % 2 ? 255 : 0;
   else if (state == ST_JAM) b = (now / 250) % 2 ? 255 : 0;
   else if (state == ST_IDLE) b = 60;
 
@@ -449,6 +525,7 @@ void loop() {
   btnMinus.check();
 
   controlStep();
+  unjamStep();
   applyRamp();
 
   if (state == ST_DONE && millis() - tState > DONE_MS) enter(ST_IDLE);
