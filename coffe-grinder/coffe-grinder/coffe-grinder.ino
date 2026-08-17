@@ -30,26 +30,31 @@ using namespace ace_button;
 #define PULSES_PER_REV 16
 #define GEAR_RATIO     51
 
+#define RPM_MIN    40
+#define RPM_MAX   110
+#define RPM_STEP    5
+#define RPM_DEFAULT 85
+
 #define SAMPLE_MS   100
 #define SENSE_N      64
 
-#define SWEEP_FROM   60
-#define SWEEP_TO    240
-#define SWEEP_STEP   20
-#define SWEEP_HOLD 1500
+#define PWM_PER_RPM 2.2
+#define KP          1.5
+#define KI          4.0
+#define I_LIMIT     30
 
-#define HOLD_PWM    200
-#define HOLD_MAX_MS 90000
+#define SLEW_UP     12
+#define SLEW_DOWN   20
 
-#define RAMP_MS      15
-#define RAMP_UP       6
-#define RAMP_DOWN    20
+#define JAM_RPM_PCT  30
+#define JAM_PWM     200
+#define JAM_MS      300
+#define START_GRACE 1500
 
-#define STALL_RPM    10
-#define STALL_MS   1500
+#define DONE_MS    2000
+#define LOAD_SPAN   200
 
-#define MODE_SWEEP 0
-#define MODE_HOLD  1
+enum State { ST_IDLE, ST_GRINDING, ST_JAM, ST_DONE };
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
@@ -60,108 +65,120 @@ AceButton btnMinus(BTN_MINUS);
 
 volatile unsigned int pulses = 0;
 
-byte mode    = MODE_SWEEP;
-bool running = false;
-bool stalled = false;
+State state = ST_IDLE;
 
-int pwmTarget = 0;
-int pwmNow    = 0;
+int targetRPM = RPM_DEFAULT;
 int rpm       = 0;
-int ris       = 0;
-int risPk     = 0;
-int lis       = 0;
+int current   = 0;
+int load      = 0;
 
-int rpmMax  = 0;
-int risMax  = 0;
-int sweepIx = 0;
+float integral = 0;
+float pwmWant  = 0;
+int   pwmNow   = 0;
 
-unsigned long tStart     = 0;
-unsigned long tSample    = 0;
-unsigned long tRamp      = 0;
-unsigned long tStep      = 0;
-unsigned long tStallFrom = 0;
-unsigned long tDraw      = 0;
+unsigned long tState   = 0;
+unsigned long tSample  = 0;
+unsigned long tRamp    = 0;
+unsigned long tJamFrom = 0;
+unsigned long tDraw    = 0;
+unsigned long grindMs  = 0;
 
 void countPulse() { pulses++; }
 
-int sensePeak = 0;
+const byte idlePwm[5]  = { 60, 100, 140, 180, 240 };
+const byte idleCur[5]  = { 50,  90, 124, 149, 166 };
 
-int senseAvg(uint8_t pin, byte n) {
-  long sum = 0;
-  int  mx  = 0;
-  for (byte i = 0; i < n; i++) {
-    int v = analogRead(pin);
-    sum += v;
-    if (v > mx) mx = v;
+int idleAt(int pwm) {
+  if (pwm <= idlePwm[0]) return idleCur[0];
+  for (byte i = 1; i < 5; i++) {
+    if (pwm <= idlePwm[i]) {
+      int dp = idlePwm[i] - idlePwm[i - 1];
+      int dc = idleCur[i] - idleCur[i - 1];
+      return idleCur[i - 1] + (long)(pwm - idlePwm[i - 1]) * dc / dp;
+    }
   }
-  sensePeak = mx;
-  return (int)(sum / n);
+  return idleCur[4];
 }
 
-void motorOff() {
+int readCurrent() {
+  long sum = 0;
+  for (byte i = 0; i < SENSE_N; i++) sum += analogRead(R_IS);
+  return (int)(sum / SENSE_N);
+}
+
+void motorStop() {
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
-  pwmNow    = 0;
-  pwmTarget = 0;
+  pwmNow   = 0;
+  pwmWant  = 0;
+  integral = 0;
 }
 
-void runStart() {
-  stalled = false;
-  running = true;
-  rpmMax  = 0;
-  risMax  = 0;
-  sweepIx = 0;
-  noInterrupts();
-  pulses = 0;
-  interrupts();
-  tStart     = millis();
-  tSample    = tStart;
-  tStep      = tStart;
-  tStallFrom = 0;
-  pwmTarget  = (mode == MODE_SWEEP) ? SWEEP_FROM : HOLD_PWM;
-  Serial.println(F("# ms,pwm,rpm,ris,rispk,lis"));
-}
+void enter(State s) {
+  state  = s;
+  tState = millis();
 
-void runStop() {
-  running   = false;
-  pwmTarget = 0;
-  Serial.print(F("# end rpmMax="));
-  Serial.print(rpmMax);
-  Serial.print(F(" risMax="));
-  Serial.print(risMax);
-  Serial.print(F(" ms="));
-  Serial.println(millis() - tStart);
-}
-
-void handleEvent(AceButton* b, uint8_t event, uint8_t state) {
-  if (event != AceButton::kEventPressed) return;
-
-  switch (b->getPin()) {
-    case BTN_START:
-      if (running) runStop();
-      else         runStart();
+  switch (s) {
+    case ST_GRINDING:
+      integral = 0;
+      pwmWant  = 0;
+      tJamFrom = 0;
+      noInterrupts();
+      pulses = 0;
+      interrupts();
+      tSample = millis();
       break;
-    case BTN_PLUS:
-    case BTN_MINUS:
-      if (!running) mode = (mode == MODE_SWEEP) ? MODE_HOLD : MODE_SWEEP;
+    case ST_JAM:
+      motorStop();
+      break;
+    case ST_DONE:
+      pwmWant = 0;
+      break;
+    case ST_IDLE:
+      motorStop();
+      rpm  = 0;
+      load = 0;
       break;
   }
 }
 
-void ramp() {
+void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
+  bool fire = (event == AceButton::kEventPressed ||
+               event == AceButton::kEventRepeatPressed);
+  if (!fire) return;
+
+  switch (b->getPin()) {
+    case BTN_PLUS:
+      if (state == ST_IDLE && targetRPM < RPM_MAX) targetRPM += RPM_STEP;
+      break;
+    case BTN_MINUS:
+      if (state == ST_IDLE && targetRPM > RPM_MIN) targetRPM -= RPM_STEP;
+      break;
+    case BTN_START:
+      if (event != AceButton::kEventPressed) break;
+      if (state == ST_GRINDING)   enter(ST_DONE);
+      else if (state == ST_JAM)   enter(ST_IDLE);
+      else if (state == ST_IDLE)  enter(ST_GRINDING);
+      break;
+  }
+}
+
+void applyRamp() {
   unsigned long now = millis();
-  if (now - tRamp < RAMP_MS) return;
+  if (now - tRamp < 15) return;
   tRamp = now;
 
-  if (pwmNow == pwmTarget) return;
-  if (pwmNow < pwmTarget) pwmNow = min(pwmNow + RAMP_UP, pwmTarget);
-  else                    pwmNow = max(pwmNow - RAMP_DOWN, pwmTarget);
+  int want = (state == ST_GRINDING) ? (int)pwmWant : 0;
+  if (pwmNow == want) return;
+
+  if (pwmNow < want) pwmNow = min(pwmNow + SLEW_UP, want);
+  else               pwmNow = max(pwmNow - SLEW_DOWN, want);
 
   analogWrite(LPWM, 0);
   analogWrite(RPWM, pwmNow);
 }
 
-void sample() {
+void controlStep() {
   unsigned long now = millis();
   unsigned int dt = now - tSample;
   if (dt < SAMPLE_MS) return;
@@ -172,58 +189,35 @@ void sample() {
   pulses = 0;
   interrupts();
 
-  rpm = ((long)p * 60000L) / ((long)dt * PULSES_PER_REV * GEAR_RATIO);
-  ris   = senseAvg(R_IS, SENSE_N);
-  risPk = sensePeak;
-  lis   = senseAvg(L_IS, 16);
+  rpm     = ((long)p * 60000L) / ((long)dt * PULSES_PER_REV * GEAR_RATIO);
+  current = readCurrent();
+  load    = constrain(current - idleAt(pwmNow), 0, LOAD_SPAN);
 
-  if (rpm > rpmMax) rpmMax = rpm;
-  if (ris > risMax) risMax = ris;
+  if (state != ST_GRINDING) return;
 
-  if (!running) return;
+  grindMs = now - tState;
 
-  Serial.print(now - tStart);
-  Serial.print(',');
-  Serial.print(pwmNow);
-  Serial.print(',');
-  Serial.print(rpm);
-  Serial.print(',');
-  Serial.print(ris);
-  Serial.print(',');
-  Serial.print(risPk);
-  Serial.print(',');
-  Serial.println(lis);
+  int err = targetRPM - rpm;
+  integral += err * (dt / 1000.0);
+  integral = constrain(integral, -I_LIMIT, I_LIMIT);
+  pwmWant  = targetRPM * PWM_PER_RPM + KP * err + KI * integral;
+  pwmWant  = constrain(pwmWant, 0, 255);
 
-  if (pwmNow > 120 && rpm < STALL_RPM) {
-    if (tStallFrom == 0) tStallFrom = now;
-    else if (now - tStallFrom > STALL_MS) {
-      runStop();
-      motorOff();
-      stalled = true;
-      Serial.println(F("# STALL"));
+  if (grindMs > START_GRACE) {
+    if (rpm < (targetRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
+      if (tJamFrom == 0) tJamFrom = now;
+      else if (now - tJamFrom > JAM_MS) enter(ST_JAM);
+    } else {
+      tJamFrom = 0;
     }
-  } else {
-    tStallFrom = 0;
   }
 }
 
-void schedule() {
-  if (!running) return;
-  unsigned long now = millis();
-
-  if (mode == MODE_SWEEP) {
-    if (now - tStep >= SWEEP_HOLD) {
-      tStep = now;
-      sweepIx++;
-      int v = SWEEP_FROM + sweepIx * SWEEP_STEP;
-      if (v > SWEEP_TO) { runStop(); return; }
-      pwmTarget = v;
-      Serial.print(F("# step "));
-      Serial.println(v);
-    }
-  } else {
-    if (now - tStart >= HOLD_MAX_MS) runStop();
-  }
+void drawBar(int y, int value, int span) {
+  display.drawRect(0, y, 128, 9, SSD1306_WHITE);
+  int w = (int)((long)value * 126 / span);
+  w = constrain(w, 0, 126);
+  if (w) display.fillRect(1, y + 1, w, 7, SSD1306_WHITE);
 }
 
 void draw() {
@@ -232,41 +226,61 @@ void draw() {
   display.setTextSize(1);
 
   display.setCursor(0, 4);
-  if (stalled)      display.print(F("STALL"));
-  else if (running) display.print(F("REC"));
-  else              display.print(mode == MODE_SWEEP ? F("SWEEP") : F("HOLD"));
+  display.print(F("SET "));
+  display.print(targetRPM);
 
-  display.setCursor(60, 4);
-  if (running) display.print((millis() - tStart) / 1000);
+  display.setCursor(78, 4);
+  switch (state) {
+    case ST_IDLE:     display.print(F("READY")); break;
+    case ST_GRINDING: display.print(grindMs / 1000); display.print(F("s")); break;
+    case ST_JAM:      display.print(F("JAM")); break;
+    case ST_DONE:     display.print(F("DONE")); break;
+  }
 
-  display.setCursor(96, 4);
-  display.print(F("pwm"));
+  if (state == ST_JAM) {
+    display.setTextSize(2);
+    display.setCursor(0, 26);
+    display.print(F("JAMMED"));
+    display.setTextSize(1);
+    display.setCursor(0, 54);
+    display.print(F("START = clear"));
+    display.display();
+    return;
+  }
 
   display.setTextSize(2);
   display.setCursor(0, 20);
   display.print(rpm);
+  display.setTextSize(1);
+  display.setCursor(40, 27);
+  display.print(F("rpm"));
+
   display.setCursor(80, 20);
+  display.print(F("pwm"));
+  display.setCursor(80, 30);
   display.print(pwmNow);
 
-  display.setTextSize(1);
   display.setCursor(0, 42);
-  display.print(F("R "));
-  display.print(ris);
-  display.print(F(" pk "));
-  display.print(risPk);
+  display.print(F("load "));
+  display.print(load);
 
-  display.setCursor(0, 54);
-  display.print(F("max "));
-  display.print(rpmMax);
-  display.print(F(" / "));
-  display.print(risMax);
-
+  drawBar(52, load, LOAD_SPAN);
   display.display();
 }
 
-void setup() {
-  Serial.begin(115200);
+void updateLeds() {
+  unsigned long now = millis();
+  int b = 40;
 
+  if (state == ST_GRINDING) b = 40 + 160 * (1 + sin(now / 250.0)) / 2;
+  else if (state == ST_JAM) b = (now / 250) % 2 ? 255 : 0;
+  else if (state == ST_IDLE) b = 60;
+
+  analogWrite(LED_START, b);
+  analogWrite(LED_PLUSMIN, state == ST_IDLE ? 30 : 10);
+}
+
+void setup() {
   pinMode(BTN_START, INPUT_PULLUP);
   pinMode(BTN_PLUS,  INPUT_PULLUP);
   pinMode(BTN_MINUS, INPUT_PULLUP);
@@ -277,7 +291,7 @@ void setup() {
   pinMode(LPWM, OUTPUT);
   pinMode(R_EN, OUTPUT);
   pinMode(L_EN, OUTPUT);
-  motorOff();
+  motorStop();
   digitalWrite(R_EN, HIGH);
   digitalWrite(L_EN, HIGH);
 
@@ -287,10 +301,14 @@ void setup() {
 
   ButtonConfig* cfg = ButtonConfig::getSystemButtonConfig();
   cfg->setEventHandler(handleEvent);
+  cfg->setFeature(ButtonConfig::kFeatureRepeatPress);
+  cfg->setRepeatPressDelay(400);
+  cfg->setRepeatPressInterval(120);
+
   cfgStart.setEventHandler(handleEvent);
 
   display.begin(SSD1306_SWITCHCAPVCC);
-  Serial.println(F("# ready"));
+  enter(ST_IDLE);
 }
 
 void loop() {
@@ -298,16 +316,16 @@ void loop() {
   btnPlus.check();
   btnMinus.check();
 
-  ramp();
-  sample();
-  schedule();
+  controlStep();
+  applyRamp();
+
+  if (state == ST_DONE && millis() - tState > DONE_MS) enter(ST_IDLE);
 
   unsigned long now = millis();
-  if (now - tDraw >= 200) {
+  if (now - tDraw >= 150) {
     tDraw = now;
     draw();
   }
 
-  analogWrite(LED_START,   running ? 200 : 50);
-  analogWrite(LED_PLUSMIN, 30);
+  updateLeds();
 }
