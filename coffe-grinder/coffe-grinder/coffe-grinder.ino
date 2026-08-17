@@ -2,6 +2,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <AceButton.h>
+#include <EEPROM.h>
 
 using namespace ace_button;
 
@@ -54,6 +55,16 @@ using namespace ace_button;
 #define DONE_MS    2000
 #define LOAD_SPAN   200
 
+#define PLATEAU_MIN   60
+#define EMPTY_PCT     35
+#define EMPTY_MS    1500
+#define MAX_GRIND_MS 120000UL
+
+#define EE_MAGIC_ADDR 0
+#define EE_RPM_ADDR   1
+#define EE_MAGIC      0xC0
+#define EE_SAVE_MS    3000
+
 enum State { ST_IDLE, ST_GRINDING, ST_JAM, ST_DONE };
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
@@ -71,6 +82,16 @@ int targetRPM = RPM_DEFAULT;
 int rpm       = 0;
 int current   = 0;
 int load      = 0;
+int loadEMA   = 0;
+int plateau   = 0;
+
+bool armed      = false;
+bool autoStop   = false;
+bool eeDirty    = false;
+
+unsigned long tEmptyFrom = 0;
+unsigned long tEeChange  = 0;
+unsigned long doseMs     = 0;
 
 float integral = 0;
 float pwmWant  = 0;
@@ -100,6 +121,18 @@ int idleAt(int pwm) {
   return idleCur[4];
 }
 
+void loadSettings() {
+  if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC) return;
+  int v = EEPROM.read(EE_RPM_ADDR);
+  if (v >= RPM_MIN && v <= RPM_MAX) targetRPM = v;
+}
+
+void saveSettings() {
+  EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC);
+  EEPROM.update(EE_RPM_ADDR, targetRPM);
+  eeDirty = false;
+}
+
 int readCurrent() {
   long sum = 0;
   for (byte i = 0; i < SENSE_N; i++) sum += analogRead(R_IS);
@@ -123,6 +156,12 @@ void enter(State s) {
       integral = 0;
       pwmWant  = 0;
       tJamFrom = 0;
+      tEmptyFrom = 0;
+      plateau  = 0;
+      loadEMA  = 0;
+      armed    = false;
+      autoStop = false;
+      if (eeDirty) saveSettings();
       noInterrupts();
       pulses = 0;
       interrupts();
@@ -149,14 +188,26 @@ void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
 
   switch (b->getPin()) {
     case BTN_PLUS:
-      if (state == ST_IDLE && targetRPM < RPM_MAX) targetRPM += RPM_STEP;
+      if (state == ST_IDLE && targetRPM < RPM_MAX) {
+        targetRPM += RPM_STEP;
+        eeDirty = true;
+        tEeChange = millis();
+      }
       break;
     case BTN_MINUS:
-      if (state == ST_IDLE && targetRPM > RPM_MIN) targetRPM -= RPM_STEP;
+      if (state == ST_IDLE && targetRPM > RPM_MIN) {
+        targetRPM -= RPM_STEP;
+        eeDirty = true;
+        tEeChange = millis();
+      }
       break;
     case BTN_START:
       if (event != AceButton::kEventPressed) break;
-      if (state == ST_GRINDING)   enter(ST_DONE);
+      if (state == ST_GRINDING) {
+        doseMs   = grindMs;
+        autoStop = false;
+        enter(ST_DONE);
+      }
       else if (state == ST_JAM)   enter(ST_IDLE);
       else if (state == ST_IDLE)  enter(ST_GRINDING);
       break;
@@ -192,6 +243,7 @@ void controlStep() {
   rpm     = ((long)p * 60000L) / ((long)dt * PULSES_PER_REV * GEAR_RATIO);
   current = readCurrent();
   load    = constrain(current - idleAt(pwmNow), 0, LOAD_SPAN);
+  loadEMA = (loadEMA * 7 + load * 3) / 10;
 
   if (state != ST_GRINDING) return;
 
@@ -203,13 +255,33 @@ void controlStep() {
   pwmWant  = targetRPM * PWM_PER_RPM + KP * err + KI * integral;
   pwmWant  = constrain(pwmWant, 0, 255);
 
-  if (grindMs > START_GRACE) {
-    if (rpm < (targetRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
-      if (tJamFrom == 0) tJamFrom = now;
-      else if (now - tJamFrom > JAM_MS) enter(ST_JAM);
-    } else {
-      tJamFrom = 0;
+  if (grindMs <= START_GRACE) return;
+
+  if (rpm < (targetRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
+    if (tJamFrom == 0) tJamFrom = now;
+    else if (now - tJamFrom > JAM_MS) { enter(ST_JAM); return; }
+  } else {
+    tJamFrom = 0;
+  }
+
+  if (loadEMA > plateau) plateau = loadEMA;
+  if (plateau >= PLATEAU_MIN) armed = true;
+
+  if (armed && loadEMA < (plateau * EMPTY_PCT) / 100) {
+    if (tEmptyFrom == 0) tEmptyFrom = now;
+    else if (now - tEmptyFrom > EMPTY_MS) {
+      doseMs   = grindMs;
+      autoStop = true;
+      enter(ST_DONE);
+      return;
     }
+  } else {
+    tEmptyFrom = 0;
+  }
+
+  if (grindMs > MAX_GRIND_MS) {
+    doseMs = grindMs;
+    enter(ST_DONE);
   }
 }
 
@@ -234,7 +306,11 @@ void draw() {
     case ST_IDLE:     display.print(F("READY")); break;
     case ST_GRINDING: display.print(grindMs / 1000); display.print(F("s")); break;
     case ST_JAM:      display.print(F("JAM")); break;
-    case ST_DONE:     display.print(F("DONE")); break;
+    case ST_DONE:
+      display.print(autoStop ? F("AUTO ") : F("STOP "));
+      display.print(doseMs / 1000);
+      display.print(F("s"));
+      break;
   }
 
   if (state == ST_JAM) {
@@ -262,9 +338,13 @@ void draw() {
 
   display.setCursor(0, 42);
   display.print(F("load "));
-  display.print(load);
+  display.print(loadEMA);
+  if (armed) {
+    display.print(F(" / "));
+    display.print(plateau);
+  }
 
-  drawBar(52, load, LOAD_SPAN);
+  drawBar(52, loadEMA, LOAD_SPAN);
   display.display();
 }
 
@@ -307,6 +387,7 @@ void setup() {
 
   cfgStart.setEventHandler(handleEvent);
 
+  loadSettings();
   display.begin(SSD1306_SWITCHCAPVCC);
   enter(ST_IDLE);
 }
@@ -320,6 +401,8 @@ void loop() {
   applyRamp();
 
   if (state == ST_DONE && millis() - tState > DONE_MS) enter(ST_IDLE);
+
+  if (eeDirty && state == ST_IDLE && millis() - tEeChange > EE_SAVE_MS) saveSettings();
 
   unsigned long now = millis();
   if (now - tDraw >= 150) {
