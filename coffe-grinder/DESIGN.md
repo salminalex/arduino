@@ -116,6 +116,9 @@ with it connected) and Bambu Studio (never opens the port).
 All measurements at the burr shaft unless stated. `rpm = pulses / 16 / 51` per
 minute. Current values are raw 10-bit ADC on R_IS, not amps.
 
+Note: the current column of `log-1-idle-sweep.csv` predates the averaging fix and
+is invalid. Use `log-4-idle-sweep.csv` for unloaded current.
+
 ### 4.1 PWM -> RPM, no beans
 
 ```
@@ -154,7 +157,37 @@ roughly one minute.
 
 `L_IS` reads 0 during forward rotation — only the active half-bridge reports.
 
-### 4.4 Current sense: the aliasing trap
+### 4.4 Current vs speed, and the coffee contribution
+
+Both sweeps with 64-sample averaging. `delta` is the work the coffee actually
+costs at that speed.
+
+```
+PWM      60   80  100  120  140  160  180  200  220  240
+idle     50   72   90  106  124  139  149  154  158  166
+loaded   77  151  195  236  277  302  323  337  327  342
+delta    27   79  106  130  153  164  174  182  169  176
+```
+
+Cross-check: idle at PWM 200 reads 154 here and 150 in the hold run of 4.3 —
+two different firmware builds on different runs, same number. The method is
+sound.
+
+**Baseline is not linear in speed.** From 27 to 95 rpm it climbs about 1.5 units
+per rpm, above that only 0.7. Rescaling a stored baseline with a single linear
+factor would be wrong at the ends, so the firmware carries a five-point table
+with interpolation instead — about twenty bytes of flash for an exact answer.
+
+**The coffee contribution saturates near 175 units above PWM 180.** Past that
+point extra speed does not extract more work from the burrs, it only pushes
+beans through faster. Consistent with 70-90 rpm being the sensible working
+range, with torque headroom left over.
+
+**The batch peak is useless — do not carry it into the production firmware.** At
+idle it *falls* from 435 to 309 as PWM rises, so it tracks switching transients,
+not motor current. Only the average is meaningful.
+
+### 4.5 Current sense: the aliasing trap
 
 The BTS7960 IS pin carries a current-mirror signal that is **chopped by the
 PWM**. A single `analogRead()` samples one arbitrary point of that ~2 ms
@@ -215,7 +248,8 @@ threshold = baseline + 0.35 * (plateau - baseline)
 - `plateau` — the loaded level, measured during the current grind.
 - `baseline` — the empty level, measured from the **tail of the previous grind**
   (after auto-stop the motor keeps spinning empty for a couple of seconds) and
-  stored in EEPROM.
+  stored in EEPROM. When the target speed changes, rescale it through the
+  five-point idle table of 4.4 rather than a linear factor.
 
 This self-calibrates on every grind, and it also absorbs driver heating and
 supply sag for free. **No separate calibration mode is needed** — a normal grind
@@ -227,8 +261,9 @@ Two edge cases that must be handled or the scheme breaks:
   but use a deliberately conservative threshold — better to stop late than to
   stop mid-dose. The first complete cycle replaces the seed.
 - **Target rpm changed**: baseline taken at 95 rpm is wrong at 60 rpm. Store the
-  baseline together with the rpm it was measured at, and mark it stale when the
-  target changes.
+  baseline together with the rpm it was measured at, and when the target moves,
+  shift it by the difference the idle table of 4.4 predicts between those two
+  speeds. No blind grind is needed.
 
 Instead of a calibration mode, expose a **diagnostics screen** showing baseline,
 plateau, computed threshold and live current. When behaviour looks wrong this
@@ -312,9 +347,14 @@ new data is required.
 ## 8. Status
 
 Done: all modules verified individually (buttons, display, encoder, both bridge
-directions, both current sensors); PWM->RPM curves loaded and unloaded; load
-signature with both transitions; a minimal grind firmware with PI control, jam
-stop and a load bar.
+directions, both current sensors); PWM->RPM curves loaded and unloaded; current
+vs speed for both states; load signature with both transitions; a minimal grind
+firmware with PI control, jam stop and a load bar.
+
+**Measurement phase is complete** — everything the planned features need has been
+captured. The one deliberate omission is reverse under load: jamming the grinder
+on purpose to measure it is not worth the risk, so reverse gets validated with a
+short low-PWM pulse while the jam recovery is being written.
 
 Next: state machine skeleton (SLEEP / IDLE / GRINDING / JAM / DONE), EEPROM
 persistence, self-calibrating thresholds, auto-stop, jam reverse, burr mileage
