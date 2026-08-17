@@ -109,6 +109,31 @@ Also stop any running log capture (`pkill -f capture.py`) — it holds the port.
 Two things once suspected and since **cleared**: the encoder (uploads work fine
 with it connected) and Bambu Studio (never opens the port).
 
+### When avrdude fails anyway
+
+There is a second, independent failure mode: the IDE is closed, `lsof` shows the
+port free, the board is visibly running (display, buttons) — and `arduino-cli
+upload` still reports `not in sync: resp=0x00` ten times in a row. Here avrdude
+itself is at fault; it misses the bootloader window on this board.
+
+To tell the two apart, talk to the bootloader by hand: pulse DTR+RTS through
+`TIOCMBIS`/`TIOCMBIC` and immediately send `0 ` (`0x30 0x20`) at 57600. A reply
+of `14 10` (INSYNC + OK) means the board and its bootloader are fine and only
+avrdude is failing.
+
+`flash.py` is the workaround and now the primary upload path — it speaks STK500v1
+directly and hits the window reliably:
+
+```
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328old \
+  --output-dir build coffe-grinder
+python3 flash.py build/coffe-grinder.ino.hex
+```
+
+It resets the board, checks the signature is `1e950f` (ATmega328P) before writing
+anything, programs 128-byte pages, reads every page back to verify, then leaves
+programming mode so the sketch starts. About a minute for 20 KB.
+
 ---
 
 ## 4. Measured data
@@ -356,9 +381,21 @@ captured. The one deliberate omission is reverse under load: jamming the grinder
 on purpose to measure it is not worth the risk, so reverse gets validated with a
 short low-PWM pulse while the jam recovery is being written.
 
-Next: state machine skeleton (SLEEP / IDLE / GRINDING / JAM / DONE), EEPROM
-persistence, self-calibrating thresholds, auto-stop, jam reverse, burr mileage
-and shot counters, settings screen, sleep with wake on button.
+Firmware built and verified on hardware since: the state machine (IDLE /
+GRINDING / JAM / DONE), auto-stop on the beans-empty plateau drop, target rpm
+persisted in EEPROM, and power-down sleep with wake on START.
+
+Sleep details: `SLEEP_MODE_PWR_DOWN` entered after `SLEEP_MS` idle, woken by
+PCINT11 on A3 (START). The ADC is switched off before sleeping and restored
+after; the display goes to `SSD1306_DISPLAYOFF`, both bridge enables drop, and
+pending EEPROM writes are flushed first. `millis()` stops during power-down, so
+every timer is re-based on wake. The ISR body is empty — waking is the point.
+
+**Sleep timeout is 60 s** (tested at 20 s, 5 min judged too long in use).
+
+Next: jam reverse recovery, burr mileage and shot counters in EEPROM, settings
+and diagnostics screen (baseline, plateau, threshold, live current), cleaning
+reminder.
 
 Open decisions: which settings are editable beyond target rpm, cleaning reminder
-threshold, sleep timeout.
+threshold.

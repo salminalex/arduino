@@ -3,6 +3,7 @@
 #include <Adafruit_SSD1306.h>
 #include <AceButton.h>
 #include <EEPROM.h>
+#include <avr/sleep.h>
 
 using namespace ace_button;
 
@@ -65,6 +66,8 @@ using namespace ace_button;
 #define EE_MAGIC      0xC0
 #define EE_SAVE_MS    3000
 
+#define SLEEP_MS   60000UL
+
 enum State { ST_IDLE, ST_GRINDING, ST_JAM, ST_DONE };
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
@@ -92,6 +95,7 @@ bool eeDirty    = false;
 unsigned long tEmptyFrom = 0;
 unsigned long tEeChange  = 0;
 unsigned long doseMs     = 0;
+unsigned long tActivity  = 0;
 
 float integral = 0;
 float pwmWant  = 0;
@@ -185,6 +189,8 @@ void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
   bool fire = (event == AceButton::kEventPressed ||
                event == AceButton::kEventRepeatPressed);
   if (!fire) return;
+
+  tActivity = millis();
 
   switch (b->getPin()) {
     case BTN_PLUS:
@@ -283,6 +289,50 @@ void controlStep() {
     doseMs = grindMs;
     enter(ST_DONE);
   }
+}
+
+ISR(PCINT1_vect) {}
+
+void goSleep() {
+  motorStop();
+  digitalWrite(R_EN, LOW);
+  digitalWrite(L_EN, LOW);
+
+  analogWrite(LED_START, 0);
+  analogWrite(LED_PLUSMIN, 0);
+  digitalWrite(LED_START, LOW);
+  digitalWrite(LED_PLUSMIN, LOW);
+
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  if (eeDirty) saveSettings();
+
+  PCMSK1 |= (1 << PCINT11);
+  PCICR  |= (1 << PCIE1);
+
+  byte adc = ADCSRA;
+  ADCSRA = 0;
+
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  cli();
+  sleep_enable();
+  sei();
+  sleep_cpu();
+  sleep_disable();
+
+  ADCSRA = adc;
+  PCMSK1 &= ~(1 << PCINT11);
+
+  while (digitalRead(BTN_START) == LOW) delay(10);
+  delay(50);
+
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  digitalWrite(R_EN, HIGH);
+  digitalWrite(L_EN, HIGH);
+
+  tActivity = millis();
+  tSample   = millis();
+  tDraw     = 0;
+  enter(ST_IDLE);
 }
 
 void drawBar(int y, int value, int span) {
@@ -389,6 +439,7 @@ void setup() {
 
   loadSettings();
   display.begin(SSD1306_SWITCHCAPVCC);
+  tActivity = millis();
   enter(ST_IDLE);
 }
 
@@ -403,6 +454,8 @@ void loop() {
   if (state == ST_DONE && millis() - tState > DONE_MS) enter(ST_IDLE);
 
   if (eeDirty && state == ST_IDLE && millis() - tEeChange > EE_SAVE_MS) saveSettings();
+
+  if (state == ST_IDLE && millis() - tActivity > SLEEP_MS) goSleep();
 
   unsigned long now = millis();
   if (now - tDraw >= 150) {
