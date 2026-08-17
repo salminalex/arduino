@@ -30,205 +30,192 @@ using namespace ace_button;
 #define PULSES_PER_REV 16.0
 #define GEAR_RATIO     51.0
 
-#define TEST_PWM  80
-#define TEST_MS  800
+#define RPM_MIN    40
+#define RPM_MAX   110
+#define RPM_STEP    5
+
+#define SAMPLE_MS   100
+#define PWM_PER_RPM 2.7
+#define KP          1.5
+#define KI          4.0
+#define I_LIMIT     30.0
+
+#define SLEW_UP     12
+#define SLEW_DOWN   20
+
+#define JAM_RPM     15
+#define JAM_MS     1500
+#define START_GRACE 1200
+
+#define LOAD_MAX    400
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
 ButtonConfig cfgStart;
 AceButton btnStart(&cfgStart, BTN_START);
+AceButton btnPlus(BTN_PLUS);
+AceButton btnMinus(BTN_MINUS);
 
-volatile long pulses  = 0;
-volatile long pulsesB = 0;
-volatile bool lastB   = false;
+volatile long pulses = 0;
 
-int  step   = 0;
-bool runNow = false;
-long lastB_count = 0;
+int   targetRPM = 80;
+float shaftRPM  = 0;
+float integral  = 0;
+float pwmOut    = 0;
 
-char title[16]   = "DIAGNOSTICS";
-char line1[22]   = "";
-char line2[22]   = "";
-char verdict[16] = "";
-char hint[22]    = "START = step 1";
+bool running = false;
+bool jam     = false;
+
+int   load     = 0;
+float loadEMA  = 0;
+
+unsigned long lastSample = 0;
+unsigned long lastDraw   = 0;
+unsigned long startedAt  = 0;
+unsigned long jamSince   = 0;
 
 void countPulse() { pulses++; }
-
-ISR(PCINT2_vect) {
-  bool now = (PIND & (1 << PD4)) != 0;
-  if (now && !lastB) pulsesB++;
-  lastB = now;
-}
-
-void resetPulses() {
-  noInterrupts();
-  pulses = 0;
-  pulsesB = 0;
-  interrupts();
-}
 
 void motorOff() {
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
+  pwmOut   = 0;
+  integral = 0;
+}
+
+void startGrind() {
+  jam     = false;
+  running = true;
+  integral = 0;
+  pwmOut   = 0;
+  loadEMA  = 0;
+  noInterrupts();
+  pulses = 0;
+  interrupts();
+  startedAt  = millis();
+  lastSample = millis();
+  jamSince   = 0;
+}
+
+void stopGrind() {
+  running = false;
+  jamSince = 0;
 }
 
 void handleEvent(AceButton* b, uint8_t event, uint8_t state) {
-  if (event == AceButton::kEventPressed) runNow = true;
+  bool fire = (event == AceButton::kEventPressed ||
+               event == AceButton::kEventRepeatPressed);
+
+  switch (b->getPin()) {
+    case BTN_PLUS:
+      if (fire && targetRPM < RPM_MAX) targetRPM += RPM_STEP;
+      break;
+    case BTN_MINUS:
+      if (fire && targetRPM > RPM_MIN) targetRPM -= RPM_STEP;
+      break;
+    case BTN_START:
+      if (event == AceButton::kEventPressed) {
+        if (running) stopGrind();
+        else         startGrind();
+      }
+      break;
+  }
 }
 
-void render() {
+void control() {
+  unsigned long now = millis();
+  unsigned long dt  = now - lastSample;
+  if (dt < SAMPLE_MS) return;
+  lastSample = now;
+
+  noInterrupts();
+  long p = pulses;
+  pulses = 0;
+  interrupts();
+
+  shaftRPM = (p / PULSES_PER_REV) / (dt / 60000.0) / GEAR_RATIO;
+
+  load    = analogRead(R_IS);
+  loadEMA = loadEMA * 0.7 + load * 0.3;
+
+  float want = 0;
+
+  if (running) {
+    float err = targetRPM - shaftRPM;
+    integral += err * (dt / 1000.0);
+    integral = constrain(integral, -I_LIMIT, I_LIMIT);
+    want = targetRPM * PWM_PER_RPM + KP * err + KI * integral;
+    want = constrain(want, 0, 255);
+  }
+
+  if (want > pwmOut) pwmOut = min(pwmOut + SLEW_UP, want);
+  else               pwmOut = max(pwmOut - SLEW_DOWN, want);
+
+  analogWrite(LPWM, 0);
+  analogWrite(RPWM, (int)pwmOut);
+
+  if (running && now - startedAt > START_GRACE) {
+    if (shaftRPM < JAM_RPM && pwmOut > 150) {
+      if (jamSince == 0) jamSince = now;
+      else if (now - jamSince > JAM_MS) {
+        stopGrind();
+        motorOff();
+        analogWrite(RPWM, 0);
+        jam = true;
+      }
+    } else {
+      jamSince = 0;
+    }
+  }
+}
+
+void drawBar(int y, int value, int maxValue) {
+  display.drawRect(0, y, 128, 9, SSD1306_WHITE);
+  int w = (int)((long)value * 126 / maxValue);
+  w = constrain(w, 0, 126);
+  if (w > 0) display.fillRect(1, y + 1, w, 7, SSD1306_WHITE);
+}
+
+void draw() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
   display.setTextSize(1);
-
   display.setCursor(0, 4);
-  display.print(title);
+  display.print("SET ");
+  display.print(targetRPM);
 
+  display.setCursor(74, 4);
+  if (jam)          display.print("JAM STOP");
+  else if (running) display.print((millis() - startedAt) / 1000);
+  else              display.print("READY");
+
+  display.setTextSize(2);
   display.setCursor(0, 20);
-  display.print(line1);
-  display.setCursor(0, 32);
-  display.print(line2);
-  display.setCursor(0, 44);
-  display.print(verdict);
-  display.setCursor(0, 56);
-  display.print(hint);
+  display.print((int)shaftRPM);
+  display.setTextSize(1);
+  display.setCursor(46, 27);
+  display.print("rpm");
+
+  display.setCursor(80, 20);
+  display.print("pwm");
+  display.setCursor(80, 30);
+  display.print((int)pwmOut);
+
+  display.setCursor(0, 42);
+  display.print("load ");
+  display.print((int)loadEMA);
+
+  drawBar(52, (int)loadEMA, LOAD_MAX);
 
   display.display();
 }
 
-void busy(const char* t, const char* what) {
-  strncpy(title, t, sizeof(title) - 1);
-  line1[0] = line2[0] = verdict[0] = 0;
-  strncpy(hint, what, sizeof(hint) - 1);
-  render();
-}
-
-void finish(const char* t, const char* nextHint) {
-  strncpy(title, t, sizeof(title) - 1);
-  strncpy(hint, nextHint, sizeof(hint) - 1);
-  render();
-}
-
-int readSense(uint8_t pin) {
-  long sum = 0;
-  for (int i = 0; i < 32; i++) sum += analogRead(pin);
-  return sum / 32;
-}
-
-long spin(uint8_t pwmPin, bool enable, int* senseDuring, uint8_t sensePin) {
-  digitalWrite(R_EN, enable ? HIGH : LOW);
-  digitalWrite(L_EN, enable ? HIGH : LOW);
-
-  resetPulses();
-
-  for (int v = 0; v <= TEST_PWM; v += 4) {
-    analogWrite(pwmPin, v);
-    delay(12);
-  }
-
-  delay(TEST_MS / 2);
-  if (senseDuring) *senseDuring = readSense(sensePin);
-  delay(TEST_MS / 2);
-
-  noInterrupts();
-  long p = pulses;
-  lastB_count = pulsesB;
-  interrupts();
-
-  for (int v = TEST_PWM; v >= 0; v -= 4) {
-    analogWrite(pwmPin, v);
-    delay(8);
-  }
-  motorOff();
-  digitalWrite(R_EN, HIGH);
-  digitalWrite(L_EN, HIGH);
-
-  return p;
-}
-
-void stepIdle() {
-  motorOff();
-  delay(300);
-
-  resetPulses();
-  delay(500);
-  noInterrupts();
-  long p = pulses;
-  long b = pulsesB;
-  interrupts();
-
-  int r = readSense(R_IS);
-  int l = readSense(L_IS);
-
-  snprintf(line1, sizeof(line1), "R_IS %d  L_IS %d", r, l);
-  snprintf(line2, sizeof(line2), "idle A %ld B %ld", p, b);
-
-  if (p > 3)               snprintf(verdict, sizeof(verdict), "SPINS IDLE!");
-  else if (r > 60 || l > 60) snprintf(verdict, sizeof(verdict), "LEAK?");
-  else                     snprintf(verdict, sizeof(verdict), "ok");
-}
-
-void stepForward() {
-  int before = readSense(R_IS);
-  int during = 0;
-  long p = spin(RPWM, true, &during, R_IS);
-  snprintf(line1, sizeof(line1), "A %ld  B %ld", p, lastB_count);
-  snprintf(line2, sizeof(line2), "R_IS %d>%d", before, during);
-  snprintf(verdict, sizeof(verdict), "%s", p > 50 ? "RPWM ok" : "NO SPIN!");
-}
-
-void stepReverse() {
-  int before = readSense(L_IS);
-  int during = 0;
-  long p = spin(LPWM, true, &during, L_IS);
-  snprintf(line1, sizeof(line1), "A %ld  B %ld", p, lastB_count);
-  snprintf(line2, sizeof(line2), "L_IS %d>%d", before, during);
-  snprintf(verdict, sizeof(verdict), "%s", p > 50 ? "LPWM ok" : "NO SPIN!");
-}
-
-void stepEnableOff() {
-  long p = spin(RPWM, false, NULL, R_IS);
-  snprintf(line1, sizeof(line1), "A %ld  B %ld", p, lastB_count);
-  snprintf(line2, sizeof(line2), "must stay 0");
-  snprintf(verdict, sizeof(verdict), "%s", p < 20 ? "EN ok" : "EN BAD!");
-}
-
-void stepEncoder() {
-  digitalWrite(R_EN, HIGH);
-  digitalWrite(L_EN, HIGH);
-
-  resetPulses();
-
-  unsigned long t0 = millis();
-  for (int v = 0; v <= 140; v += 4) {
-    analogWrite(RPWM, v);
-    delay(12);
-  }
-  delay(1000);
-
-  noInterrupts();
-  long p = pulses;
-  long b = pulsesB;
-  interrupts();
-  unsigned long dt = millis() - t0;
-
-  for (int v = 140; v >= 0; v -= 4) {
-    analogWrite(RPWM, v);
-    delay(8);
-  }
-  motorOff();
-
-  float mot = (p / PULSES_PER_REV) / (dt / 60000.0);
-  float shaft = mot / GEAR_RATIO;
-
-  snprintf(line1, sizeof(line1), "A %ld  B %ld", p, b);
-  snprintf(line2, sizeof(line2), "%d / %d rpm", (int)mot, (int)shaft);
-  snprintf(verdict, sizeof(verdict), "%s", p > 200 ? "encoder ok" : "NO PULSES!");
-}
-
 void setup() {
   pinMode(BTN_START, INPUT_PULLUP);
-  pinMode(LED_START, OUTPUT);
+  pinMode(BTN_PLUS,  INPUT_PULLUP);
+  pinMode(BTN_MINUS, INPUT_PULLUP);
+  pinMode(LED_START,   OUTPUT);
   pinMode(LED_PLUSMIN, OUTPUT);
 
   pinMode(RPWM, OUTPUT);
@@ -243,52 +230,36 @@ void setup() {
   pinMode(ENCODER_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENCODER_A), countPulse, RISING);
 
-  lastB   = (PIND & (1 << PD4)) != 0;
-  PCICR  |= (1 << PCIE2);
-  PCMSK2 |= (1 << PCINT20);
+  ButtonConfig* cfg = ButtonConfig::getSystemButtonConfig();
+  cfg->setEventHandler(handleEvent);
+  cfg->setFeature(ButtonConfig::kFeatureRepeatPress);
+  cfg->setRepeatPressDelay(400);
+  cfg->setRepeatPressInterval(120);
 
   cfgStart.setEventHandler(handleEvent);
 
   display.begin(SSD1306_SWITCHCAPVCC);
-  render();
+  lastSample = millis();
 }
 
 void loop() {
   btnStart.check();
+  btnPlus.check();
+  btnMinus.check();
 
-  analogWrite(LED_START,   60);
-  analogWrite(LED_PLUSMIN, 20);
+  control();
 
-  if (!runNow) return;
-  runNow = false;
-
-  switch (step) {
-    case 0:
-      busy("1 IDLE", "checking...");
-      stepIdle();
-      finish("1 IDLE", "START = forward");
-      break;
-    case 1:
-      busy("2 FORWARD", "spinning...");
-      stepForward();
-      finish("2 FORWARD", "START = reverse");
-      break;
-    case 2:
-      busy("3 REVERSE", "spinning...");
-      stepReverse();
-      finish("3 REVERSE", "START = EN test");
-      break;
-    case 3:
-      busy("4 ENABLE OFF", "must NOT spin");
-      stepEnableOff();
-      finish("4 ENABLE OFF", "START = encoder");
-      break;
-    case 4:
-      busy("5 ENCODER", "spinning...");
-      stepEncoder();
-      finish("5 ENCODER", "START = restart");
-      break;
+  unsigned long now = millis();
+  if (now - lastDraw >= 150) {
+    lastDraw = now;
+    draw();
   }
 
-  step = (step + 1) % 5;
+  if (running) {
+    int b = 40 + 160 * (1 + sin(now / 250.0)) / 2;
+    analogWrite(LED_START, b);
+  } else {
+    analogWrite(LED_START, jam ? 255 : 60);
+  }
+  analogWrite(LED_PLUSMIN, 30);
 }
