@@ -61,7 +61,11 @@ using namespace ace_button;
 #define UNJAM_TRIES     3
 #define UNJAM_RPM_OK   25
 
-#define DONE_MS    2000
+#define TORQUE_PWM    245
+#define TORQUE_PCT     90
+#define TORQUE_MS    2000
+
+#define DONE_MS    4000
 #define LOAD_SPAN   200
 
 #define PLATEAU_MIN   60
@@ -69,14 +73,22 @@ using namespace ace_button;
 #define EMPTY_MS    1500
 #define MAX_GRIND_MS 120000UL
 
+#define BREATH_MS   1500
+
+#define MENU_HOLD   1000
+#define MENU_ITEMS     3
+#define MENU_IDLE_MS 15000UL
+
 #define EE_MAGIC_ADDR 0
 #define EE_RPM_ADDR   1
+#define EE_FLAGS_ADDR 2
+#define EE_F_EXPERT 0x01
 #define EE_MAGIC      0xC0
 #define EE_SAVE_MS    3000
 
 #define SLEEP_MS   60000UL
 
-enum State { ST_IDLE, ST_GRINDING, ST_UNJAM, ST_JAM, ST_DONE };
+enum State { ST_IDLE, ST_GRINDING, ST_UNJAM, ST_JAM, ST_DONE, ST_MENU };
 
 Adafruit_SSD1306 display(128, 64, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
@@ -96,11 +108,38 @@ int load      = 0;
 int loadEMA   = 0;
 int plateau   = 0;
 
+#define STOP_USER 0
+#define STOP_AUTO 1
+#define STOP_TIME 2
+
 bool armed      = false;
-bool autoStop   = false;
+byte stopReason = STOP_USER;
 bool eeDirty    = false;
 bool unjamSpun  = false;
 byte unjamTry   = 0;
+
+int  loadAcc    = 0;
+int  rpmAcc     = 0;
+int  effRPM     = RPM_DEFAULT;
+bool torqueLow  = false;
+unsigned long tSatFrom = 0;
+
+bool expert    = false;
+bool menuArmed = false;
+bool menuEdit  = false;
+byte menuSel   = 0;
+byte page      = 0;
+unsigned long tCombo = 0;
+
+unsigned int  loopCount = 0;
+unsigned int  loopHz    = 0;
+unsigned long tHz       = 0;
+
+int freeRam() {
+  extern int __heap_start, *__brkval;
+  int here;
+  return (int)&here - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
 
 unsigned long tEmptyFrom = 0;
 unsigned long tEeChange  = 0;
@@ -116,6 +155,7 @@ unsigned long tSample  = 0;
 unsigned long tRamp    = 0;
 unsigned long tJamFrom = 0;
 unsigned long tDraw    = 0;
+unsigned long tGrace   = 0;
 unsigned long grindMs  = 0;
 
 void countPulse() { pulses++; }
@@ -139,11 +179,13 @@ void loadSettings() {
   if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC) return;
   int v = EEPROM.read(EE_RPM_ADDR);
   if (v >= RPM_MIN && v <= RPM_MAX) targetRPM = v;
+  expert = EEPROM.read(EE_FLAGS_ADDR) & EE_F_EXPERT;
 }
 
 void saveSettings() {
   EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC);
   EEPROM.update(EE_RPM_ADDR, targetRPM);
+  EEPROM.update(EE_FLAGS_ADDR, expert ? EE_F_EXPERT : 0);
   eeDirty = false;
 }
 
@@ -174,8 +216,14 @@ void enter(State s) {
       plateau  = 0;
       loadEMA  = 0;
       armed    = false;
-      autoStop = false;
+      stopReason = STOP_USER;
       unjamTry = 0;
+      loadAcc  = 0;
+      rpmAcc   = 0;
+      effRPM   = targetRPM;
+      torqueLow = false;
+      tSatFrom  = 0;
+      tGrace    = millis();
       if (eeDirty) saveSettings();
       noInterrupts();
       pulses = 0;
@@ -191,6 +239,12 @@ void enter(State s) {
     case ST_JAM:
       motorStop();
       break;
+    case ST_MENU:
+      motorStop();
+      menuSel   = 0;
+      menuArmed = false;
+      menuEdit  = false;
+      break;
     case ST_DONE:
       pwmWant = 0;
       break;
@@ -198,7 +252,10 @@ void enter(State s) {
       motorStop();
       rpm  = 0;
       load = 0;
+      loadAcc  = 0;
+      rpmAcc   = 0;
       unjamTry = 0;
+      torqueLow = false;
       break;
   }
 }
@@ -211,6 +268,8 @@ void resumeGrinding() {
   pwmNow   = 0;
   tJamFrom = 0;
   tEmptyFrom = 0;
+  tSatFrom = 0;
+  tGrace   = millis();
   noInterrupts();
   pulses = 0;
   interrupts();
@@ -242,6 +301,29 @@ void unjamStep() {
   else                             enter(ST_JAM);
 }
 
+void checkMenuCombo() {
+  bool plus  = digitalRead(BTN_PLUS)  == LOW;
+  bool minus = digitalRead(BTN_MINUS) == LOW;
+
+  if (state == ST_MENU) {
+    if (!plus && !minus) menuArmed = true;
+    tCombo = 0;
+    return;
+  }
+
+  if (state != ST_IDLE || !plus || !minus) {
+    tCombo = 0;
+    return;
+  }
+
+  if (tCombo == 0) tCombo = millis();
+  else if (millis() - tCombo > MENU_HOLD) {
+    tCombo    = 0;
+    tActivity = millis();
+    enter(ST_MENU);
+  }
+}
+
 void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
   bool fire = (event == AceButton::kEventPressed ||
                event == AceButton::kEventRepeatPressed);
@@ -251,28 +333,56 @@ void handleEvent(AceButton* b, uint8_t event, uint8_t state8) {
 
   switch (b->getPin()) {
     case BTN_PLUS:
-      if (state == ST_IDLE && targetRPM < RPM_MAX) {
+      if (state != ST_MENU) {
+        if (expert && event == AceButton::kEventPressed) page ^= 1;
+        break;
+      }
+      if (!menuArmed) break;
+      if (!menuEdit) {
+        menuSel = (menuSel + 1) % MENU_ITEMS;
+      } else if (targetRPM < RPM_MAX) {
         targetRPM += RPM_STEP;
-        eeDirty = true;
+        eeDirty   = true;
         tEeChange = millis();
       }
       break;
     case BTN_MINUS:
-      if (state == ST_IDLE && targetRPM > RPM_MIN) {
+      if (state != ST_MENU) {
+        if (expert && event == AceButton::kEventPressed) page ^= 1;
+        break;
+      }
+      if (!menuArmed) break;
+      if (!menuEdit) {
+        menuSel = (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
+      } else if (targetRPM > RPM_MIN) {
         targetRPM -= RPM_STEP;
-        eeDirty = true;
+        eeDirty   = true;
         tEeChange = millis();
       }
       break;
     case BTN_START:
       if (event != AceButton::kEventPressed) break;
+      if (state == ST_MENU) {
+        if (!menuArmed) break;
+        if (menuEdit) { menuEdit = false; break; }
+        if      (menuSel == 0) menuEdit = true;
+        else if (menuSel == 1) {
+          expert    = !expert;
+          page      = 0;
+          eeDirty   = true;
+          tEeChange = millis();
+        }
+        else enter(ST_IDLE);
+        break;
+      }
       if (state == ST_GRINDING) {
-        doseMs   = grindMs;
-        autoStop = false;
+        doseMs     = grindMs;
+        stopReason = STOP_USER;
         enter(ST_DONE);
       }
       else if (state == ST_JAM)   enter(ST_IDLE);
       else if (state == ST_UNJAM) enter(ST_IDLE);
+      else if (state == ST_DONE)  enter(ST_IDLE);
       else if (state == ST_IDLE)  enter(ST_GRINDING);
       break;
   }
@@ -309,25 +419,43 @@ void controlStep() {
   rpm     = ((long)p * 60000L) / ((long)dt * PULSES_PER_REV * GEAR_RATIO);
   current = readCurrent();
   load    = constrain(current - idleAt(pwmNow), 0, LOAD_SPAN);
-  if (state != ST_UNJAM) loadEMA = (loadEMA * 7 + load * 3) / 10;
+  if (state != ST_UNJAM) {
+    loadEMA  = (loadEMA * 7 + load * 3) / 10;
+    loadAcc += (load * 16 - loadAcc) / 10;
+    rpmAcc  += (rpm  * 16 - rpmAcc)  / 5;
+  }
 
   if (state != ST_GRINDING) return;
 
   grindMs = now - tState;
 
-  int err = targetRPM - rpm;
+  int err = effRPM - rpm;
   integral += err * (dt / 1000.0);
   integral = constrain(integral, -I_LIMIT, I_LIMIT);
-  pwmWant  = targetRPM * PWM_PER_RPM + KP * err + KI * integral;
+  pwmWant  = effRPM * PWM_PER_RPM + KP * err + KI * integral;
   pwmWant  = constrain(pwmWant, 0, 255);
 
-  if (grindMs <= START_GRACE) return;
+  if (now - tGrace <= START_GRACE) return;
 
-  if (rpm < (targetRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
+  if (rpm < (effRPM * JAM_RPM_PCT) / 100 && pwmNow > JAM_PWM) {
     if (tJamFrom == 0) tJamFrom = now;
     else if (now - tJamFrom > JAM_MS) { enter(ST_UNJAM); return; }
   } else {
     tJamFrom = 0;
+  }
+
+  if (pwmNow >= TORQUE_PWM && rpm < (effRPM * TORQUE_PCT) / 100) {
+    if (tSatFrom == 0) tSatFrom = now;
+    else if (now - tSatFrom > TORQUE_MS) {
+      if (effRPM > RPM_MIN) {
+        effRPM   = max(effRPM - RPM_STEP, RPM_MIN);
+        integral = 0;
+      }
+      torqueLow = true;
+      tSatFrom  = now;
+    }
+  } else {
+    tSatFrom = 0;
   }
 
   if (loadEMA > plateau) plateau = loadEMA;
@@ -336,8 +464,8 @@ void controlStep() {
   if (armed && loadEMA < (plateau * EMPTY_PCT) / 100) {
     if (tEmptyFrom == 0) tEmptyFrom = now;
     else if (now - tEmptyFrom > EMPTY_MS) {
-      doseMs   = grindMs;
-      autoStop = true;
+      doseMs     = grindMs;
+      stopReason = STOP_AUTO;
       enter(ST_DONE);
       return;
     }
@@ -346,7 +474,8 @@ void controlStep() {
   }
 
   if (grindMs > MAX_GRIND_MS) {
-    doseMs = grindMs;
+    doseMs     = grindMs;
+    stopReason = STOP_TIME;
     enter(ST_DONE);
   }
 }
@@ -402,26 +531,102 @@ void drawBar(int y, int value, int span) {
   if (w) display.fillRect(1, y + 1, w, 7, SSD1306_WHITE);
 }
 
+void drawMenu() {
+  display.setCursor(0, 0);
+  display.print(F("SETTINGS"));
+  display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
+
+  display.setCursor(0, 18);
+  display.print(menuSel == 0 ? '>' : ' ');
+  display.setCursor(12, 18);
+  display.print(F("SPEED"));
+  if (menuEdit) {
+    display.fillRect(88, 16, 28, 11, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  }
+  display.setCursor(92, 18);
+  display.print(targetRPM);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 31);
+  display.print(menuSel == 1 ? '>' : ' ');
+  display.setCursor(12, 31);
+  display.print(F("DETAILS"));
+  display.setCursor(92, 31);
+  display.print(expert ? F("[x]") : F("[ ]"));
+
+  display.setCursor(0, 44);
+  display.print(menuSel == 2 ? '>' : ' ');
+  display.setCursor(12, 44);
+  display.print(F("EXIT"));
+
+  display.setCursor(0, 56);
+  display.print(menuEdit ? F("+/- set   START ok")
+                         : F("+/- move  START pick"));
+  display.display();
+}
+
+void drawPair(int y, const __FlashStringHelper* la, int va,
+                     const __FlashStringHelper* lb, int vb) {
+  display.setCursor(0, y);
+  display.print(la);
+  display.print(' ');
+  display.print(va);
+  display.setCursor(66, y);
+  display.print(lb);
+  display.print(' ');
+  display.print(vb);
+}
+
+void drawDiag() {
+  display.setCursor(0, 4);
+  display.print(F("DIAG"));
+  display.setCursor(66, 4);
+  display.print(loopHz);
+  display.print(F(" Hz"));
+
+  drawPair(18, F("CUR"), current,       F("IDL"), idleAt(pwmNow));
+  drawPair(27, F("LOD"), load,          F("PWM"), pwmNow);
+  drawPair(36, F("PLT"), plateau,       F("THR"), (plateau * EMPTY_PCT) / 100);
+  drawPair(45, F("INT"), (int)integral, F("EFF"), effRPM);
+  drawPair(54, F("REV"), unjamTry,      F("RAM"), freeRam());
+  display.display();
+}
+
 void draw() {
+  int rpmShow  = rpmAcc / 16;
+  int loadShow = loadAcc / 16;
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  display.setCursor(0, 4);
-  display.print(F("SET "));
-  display.print(targetRPM);
+  if (state == ST_MENU) {
+    drawMenu();
+    return;
+  }
 
-  display.setCursor(78, 4);
-  switch (state) {
-    case ST_IDLE:     display.print(F("READY")); break;
-    case ST_GRINDING: display.print(grindMs / 1000); display.print(F("s")); break;
-    case ST_UNJAM:    display.print(F("REV ")); display.print(unjamTry); break;
-    case ST_JAM:      display.print(F("JAM")); break;
-    case ST_DONE:
-      display.print(autoStop ? F("AUTO ") : F("STOP "));
-      display.print(doseMs / 1000);
-      display.print(F("s"));
-      break;
+  if (expert && page == 1 && state != ST_UNJAM && state != ST_JAM) {
+    drawDiag();
+    return;
+  }
+
+  display.setCursor(0, expert ? 4 : 0);
+  if (expert) {
+    display.print(F("SET "));
+    display.print(targetRPM);
+    if (torqueLow) {
+      display.print('>');
+      display.print(effRPM);
+    }
+  } else if (state == ST_GRINDING) {
+    display.print(F("ACTUAL "));
+    display.print(rpmShow);
+    display.print(F(" rpm"));
+  } else {
+    display.print(F("TARGET "));
+    display.print(targetRPM);
+    display.print(F(" rpm"));
   }
 
   if (state == ST_UNJAM) {
@@ -449,9 +654,60 @@ void draw() {
     return;
   }
 
+  if (!expert) {
+    display.setTextSize(2);
+    switch (state) {
+      case ST_IDLE:
+        display.setCursor(0, 22);
+        display.print(F("READY"));
+        display.setTextSize(1);
+        display.setCursor(0, 56);
+        display.print(F("START = grind"));
+        break;
+      case ST_GRINDING:
+        display.setCursor(0, 18);
+        display.print(grindMs / 1000);
+        display.print('s');
+        drawBar(40, loadShow, LOAD_SPAN);
+        display.setTextSize(1);
+        display.setCursor(0, 56);
+        display.print(F("START = stop"));
+        break;
+      case ST_DONE:
+        display.setCursor(0, 18);
+        display.print(doseMs / 1000);
+        display.print('s');
+        display.setTextSize(1);
+        display.setCursor(0, 46);
+        if      (stopReason == STOP_AUTO) display.print(F("done"));
+        else if (stopReason == STOP_TIME) display.print(F("time limit"));
+        else                              display.print(F("stopped"));
+        break;
+      default:
+        break;
+    }
+    display.display();
+    return;
+  }
+
+  display.setCursor(78, 4);
+  switch (state) {
+    case ST_IDLE:     display.print(F("READY")); break;
+    case ST_GRINDING: display.print(grindMs / 1000); display.print(F("s")); break;
+    case ST_DONE:
+      if      (stopReason == STOP_AUTO) display.print(F("AUTO "));
+      else if (stopReason == STOP_TIME) display.print(F("TIME "));
+      else                              display.print(F("STOP "));
+      display.print(doseMs / 1000);
+      display.print(F("s"));
+      break;
+    default:
+      break;
+  }
+
   display.setTextSize(2);
   display.setCursor(0, 20);
-  display.print(rpm);
+  display.print(rpmShow);
   display.setTextSize(1);
   display.setCursor(40, 27);
   display.print(F("rpm"));
@@ -463,27 +719,36 @@ void draw() {
 
   display.setCursor(0, 42);
   display.print(F("load "));
-  display.print(loadEMA);
+  display.print(loadShow);
   if (armed) {
     display.print(F(" / "));
     display.print(plateau);
   }
 
-  drawBar(52, loadEMA, LOAD_SPAN);
+  drawBar(52, loadShow, LOAD_SPAN);
   display.display();
+}
+
+int breathe(unsigned long now, int lo, int hi, unsigned int period) {
+  float ph = (now % period) * (TWO_PI / period);
+  return lo + (int)((hi - lo) * (1.0 - cos(ph)) / 2.0);
 }
 
 void updateLeds() {
   unsigned long now = millis();
   int b = 40;
 
-  if (state == ST_GRINDING) b = 40 + 160 * (1 + sin(now / 250.0)) / 2;
-  else if (state == ST_UNJAM) b = (now / 100) % 2 ? 255 : 0;
-  else if (state == ST_JAM) b = (now / 250) % 2 ? 255 : 0;
-  else if (state == ST_IDLE) b = 60;
+  if      (state == ST_GRINDING) b = breathe(now, 0, 255, BREATH_MS);
+  else if (state == ST_UNJAM)    b = (now / 100) % 2 ? 255 : 0;
+  else if (state == ST_JAM)      b = (now / 250) % 2 ? 255 : 0;
+  else if (state == ST_IDLE)     b = 60;
+
+  int p = 0;
+  if (state == ST_MENU) p = menuEdit ? breathe(now, 0, 255, BREATH_MS) : 60;
+  else if (tCombo) p = constrain((int)((now - tCombo) * 255UL / MENU_HOLD), 0, 255);
 
   analogWrite(LED_START, b);
-  analogWrite(LED_PLUSMIN, state == ST_IDLE ? 30 : 10);
+  analogWrite(LED_PLUSMIN, p);
 }
 
 void setup() {
@@ -524,15 +789,26 @@ void loop() {
   btnPlus.check();
   btnMinus.check();
 
+  checkMenuCombo();
   controlStep();
   unjamStep();
   applyRamp();
 
   if (state == ST_DONE && millis() - tState > DONE_MS) enter(ST_IDLE);
 
+  if (state == ST_MENU && millis() - tActivity > MENU_IDLE_MS) enter(ST_IDLE);
+
   if (eeDirty && state == ST_IDLE && millis() - tEeChange > EE_SAVE_MS) saveSettings();
 
-  if (state == ST_IDLE && millis() - tActivity > SLEEP_MS) goSleep();
+  if ((state == ST_IDLE || state == ST_MENU) &&
+      millis() - tActivity > SLEEP_MS) goSleep();
+
+  loopCount++;
+  if (millis() - tHz >= 1000) {
+    loopHz    = loopCount;
+    loopCount = 0;
+    tHz       = millis();
+  }
 
   unsigned long now = millis();
   if (now - tDraw >= 150) {

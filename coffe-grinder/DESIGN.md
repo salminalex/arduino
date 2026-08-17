@@ -347,6 +347,66 @@ PWM 255 and still misses target rpm. That is physics, not a fault. The firmware
 must notice and either report "holding less than requested" or lower the target
 itself, otherwise it silently heats the driver chasing an impossible setpoint.
 
+As built: if PWM stays at 245 or above while rpm sits below 90% of the working
+setpoint for 2 s, the working setpoint drops by 5 rpm and the integral is
+cleared. Repeats down to `RPM_MIN`. Expert view shows it as `SET 85>75`.
+
+Only the *working* setpoint moves. `targetRPM` and the EEPROM copy are untouched,
+so the next grind starts from what the user actually asked for — otherwise one
+hard bean would silently redefine the setting. It also never climbs back during a
+grind: raise it, hit the limit, lower it again is a loop with no payoff over a
+16 s dose.
+
+Jam detection uses the working setpoint too. Left on the user's target, the 30%
+threshold would grow stale the moment the limiter stepped down.
+
+### 5.6 Grace after resume, not just after start
+
+Jam detection needs a blind window at the start of a grind — the motor spends
+about a second reaching speed, and until then "high PWM, low rpm" is simply what
+spin-up looks like. `START_GRACE` covers that at 1.5 s.
+
+**The same window is required after a jam recovery, and its absence was a real
+bug.** On resume PWM ramps from zero and crosses the jam threshold of 200 in a
+quarter second, while rpm still needs about a second. The jam test therefore
+fired on its own roughly 550 ms after every recovery — one real bean fragment
+would burn all three attempts and end in `JAMMED` with the burrs already clear.
+The grace timer is now re-armed by both entry paths, not derived from elapsed
+grind time.
+
+---
+
+## 5.7 Interface
+
+Two levels, because the grinder is shared. **Simple** is the default: target rpm,
+a big state word, elapsed seconds, a load bar while grinding, and a one-line hint
+at the bottom. No PWM, no load numbers. The top line switches from `TARGET 85
+rpm` at rest to `ACTUAL 84 rpm` while grinding. **Expert** restores the full
+readout and is a checkbox in settings, stored in EEPROM.
+
+Settings open by holding `+` and `−` together for 1 s from READY, and hold three
+items: SPEED, DETAILS and EXIT. START enters value editing on SPEED; `+`/`−` then
+change the value instead of moving the cursor. The menu exits by itself after 15 s
+idle so nobody gets stranded in it.
+
+In expert mode `+`/`−` are otherwise free, so a single press flips to a **DIAG**
+page: loop rate, raw current next to the interpolated idle baseline, load and
+PWM, plateau next to the auto-stop threshold, the PI integral, the working
+setpoint, reverse attempts and free RAM. Loop rate is the one to watch — software
+SPI pushes a full kilobyte to the panel and `readCurrent` takes 64 back-to-back
+ADC samples, and both block the control loop.
+
+Button rings carry state on their own: dark when the button does nothing, ramping
+up as the settings combo is held, steady in the menu, breathing while grinding or
+while editing a value. `breathe()` drives every pulse from one period constant.
+Its phase comes from `now % period` rather than raw `millis()` — a float carries
+24 bits of mantissa, so feeding it a growing millisecond count makes the fade
+stutter after about five hours of uptime.
+
+**The panel is two-colour: rows 0-15 are yellow, the rest blue, with a physical
+seam between them.** Any 8-pixel text row placed at y=10..17 straddles the seam
+and renders visibly torn. Keep headers at y≤7 and body content at y≥18.
+
 ---
 
 ## 6. Memory budget
@@ -412,9 +472,14 @@ every timer is re-based on wake. The ISR body is empty — waking is the point.
 
 **Sleep timeout is 60 s** (tested at 20 s, 5 min judged too long in use).
 
-Next: burr mileage and shot counters in EEPROM, settings and diagnostics screen
-(baseline, plateau, threshold, live current), cleaning reminder, and the torque
-limit of 5.5, which is still unhandled.
+Also built: the torque limit of 5.5, the two-level interface of 5.7 with its
+settings menu and DIAG page, and the resume grace of 5.6.
+
+Next: burr mileage and shot counters in EEPROM, cleaning reminder.
+
+Still unverified on hardware: jam detection itself. Reverse works and the state
+machine around it is exercised, but no real jam has ever been provoked — the
+thresholds come from measurement, not from a stone in the burrs.
 
 Open decisions: which settings are editable beyond target rpm, cleaning reminder
 threshold.
