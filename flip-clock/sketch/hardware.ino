@@ -4,14 +4,14 @@
 
 #include "config.h"
 
-int readHall(int pin)
+static int readHall(int pin)
 {
   uint32_t acc = 0;
   for (int i = 0; i < 4; i++) acc += analogRead(pin);   // the ESP32 ADC is noisy
   return acc / 4;
 }
 
-void moveFlaps(Drum &d, float flaps)
+static void moveFlaps(Drum &d, float flaps)
 {
   d.target += d.dir * flaps * STEPS_PER_FLAP;
   d.stepper.setMaxSpeed(SPEED);
@@ -96,7 +96,7 @@ bool homeDrum(Drum &d)
   return true;
 }
 
-void gotoNumber(Drum &d, int n)
+static void gotoNumber(Drum &d, int n)
 {
   moveFlaps(d, (n - d.value + 60) % 60);
   d.value = n;

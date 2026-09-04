@@ -37,6 +37,7 @@ hours cable needs individual leads.
 | `sketch/sketch.ino` | globals, `setup`, `loop` |
 | `sketch/hardware.ino` | steppers, hall sensors, homing |
 | `sketch/network.ino` | WiFi, portal, settings page, NVS |
+| `sketch/page.h` | the page CSS and JS, served as `/style.css` and `/app.js` |
 | `sketch/config.h` | pins, tuning constants |
 | `sketch/secrets.h` | passwords, gitignored — copy from `secrets.h.example` |
 
@@ -44,15 +45,19 @@ Needs the `AccelStepper` library. Everything else ships with the ESP32 core.
 
 ## First run
 
-1. Flash, then look for the **FlipClock** WiFi network (password in `config.h`)
+1. Flash, then look for the **FlipClock** WiFi network (passphrase from `secrets.h`)
 2. The settings page opens by itself — otherwise go to `192.168.4.1`
 3. Pick your network, timezone and 12/24 hour format, save
 4. The clock reboots, homes both drums and starts running
 
 Afterwards the same page lives at the board IP or at
-[http://flipclock.local](http://flipclock.local), behind a login. On a network
-with internet the timezone picker expands into region and city dropdowns
-covering the full IANA set, and preselects the zone your phone is in.
+[http://flipclock.local](http://flipclock.local), behind a login.
+
+**The timezone is not something you pick.** The browser knows its own offset
+and the dates it switches, so the page derives the POSIX string from that — no
+list, no lookup, and it works in the portal where there is no internet. Under
+*set manually* there is a region/city picker for the case where the clock is a
+gift to another timezone; it pulls the full IANA table when the network allows.
 
 Before the first build, copy `sketch/secrets.h.example` to `sketch/secrets.h`
 and put your own values in — the portal passphrase and the login for the
@@ -74,8 +79,12 @@ move: 0.5 nudges the drum by 17 steps.
 
 The settings page prints what the firmware currently believes each drum shows.
 Compare that with the window and add the difference to the offset: window one
-lower, add 1; one higher, subtract 1. Values live in NVS and survive
-reflashing.
+lower, add 1; one higher, subtract 1. Saving applies the correction to the
+running count straight away, so the next minute lands right — no re-homing
+needed. Values live in NVS and survive reflashing.
+
+Saving only restarts the board when the network changed. Timezone, time format
+and offsets are applied in place and the page stays where it is.
 
 If the error *grows* over an hour and resets on the hour, the offset is not the
 problem — the drum is binding or the motor is losing steps.
@@ -89,6 +98,10 @@ problem — the drum is binding or the motor is losing steps.
 - Coils are de-energised after every move. Left on, both motors cook.
 - A failed NTP read is never treated as midnight.
 - NTP is polled hourly; in between the board runs on its own crystal.
+- A drum that cannot find its magnet stops instead of stepping from a stale
+  reference, and backs off for five minutes rather than winding in circles.
+- CSS and JS are served as separate cached files, with a content hash in the
+  URL so a reflash is picked up.
 
 ## Credits
 

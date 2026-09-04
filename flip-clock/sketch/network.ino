@@ -3,6 +3,7 @@
  */
 
 #include "config.h"
+#include "page.h"
 
 // ------------------------------------------------------------ settings
 
@@ -86,28 +87,23 @@ static void scanNetworks()
   WiFi.scanDelete();
 }
 
+static uint32_t assetHash();
+
 static String htmlPage()
 {
   String p;
-  p.reserve(7000);   // the page is ~5 KB, and it is grown in small pieces
+  p.reserve(4000);   // the page is ~3 KB now that css and js are separate
 
-  p += F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<title>Flip Clock</title><style>"
-               "body{font:16px system-ui;margin:0;padding:24px;background:#111;color:#eee}"
-               "h1{font-size:20px;margin:0 0 20px}"
-               "label{display:block;margin:14px 0 4px;color:#aaa;font-size:14px}"
-               "input,select{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;"
-               "border:1px solid #444;background:#1c1c1c;color:#eee;font-size:16px}"
-               "button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;"
-               "background:#e0e0e0;color:#111;font-size:16px;font-weight:600}"
-               ".row{display:flex;gap:10px;margin-top:16px}"
-               ".tzrow{display:flex;gap:10px}.tzrow select:first-child{flex:0 0 38%}"
-               ".tzrow select:last-child{flex:1;min-width:0}"
-               ".row form{flex:1}.row button{margin:0;background:#2a2a2a;color:#ccc;font-weight:400}"
-               ".chk{display:flex;align-items:center;gap:8px;margin-top:10px}"
-               ".chk input{width:auto}"
-               ".n{color:#777;font-size:13px;margin-top:16px}"
-               "</style><h1>Flip Clock</h1><form method=POST action=/save>");
+  p += F("<!doctype html><meta charset=utf-8>"
+         "<meta name=viewport content='width=device-width,initial-scale=1'>"
+         "<title>Flip Clock</title>"
+         "<link rel=stylesheet href='/style.css?v=");
+  const String v = String(assetHash(), HEX);
+  p += v;
+  p += F("'><script src='/app.js?v=");
+  p += v;
+  p += F("' defer></script>"
+         "<h1>Flip Clock</h1><form method=POST action=/save data-ajax>");
 
   p += F("<label>WiFi network</label><input name=ssid list=nets value='");
   p += esc(cfg.ssid);
@@ -119,9 +115,11 @@ static String htmlPage()
          "<label class=chk><input type=checkbox name=nopass>open network, no password</label>");
 
   p += F("<label>Timezone</label>"
+         "<div class=n id=tzinfo>detecting...</div>"
+         "<input type=hidden id=tzval>"
+         "<details id=tzman><summary>set manually</summary>"
          "<div class=tzrow id=tzpick hidden>"
          "<select id=tzregion></select><select id=tzcity></select></div>"
-         "<input type=hidden id=tzval>"
          "<select name=tz id=tz>");
 
   bool known = false;
@@ -138,20 +136,20 @@ static String htmlPage()
     if (cfg.tz == z[0]) p += " selected";
     p += ">" + String(z[1]) + "</option>";
   }
-  p += F("</select><div class=n id=tzinfo></div>");
+  p += F("</select></details>");
 
   p += F("<label>Time format</label><select name=fmt>");
   p += cfg.fmt12 ? F("<option value=24>24 hour</option><option value=12 selected>12 hour</option>")
                  : F("<option value=24 selected>24 hour</option><option value=12>12 hour</option>");
   p += F("</select>");
 
-  p += F("<label>Home offset, hours drum</label><input name=offh type=number step=0.5 value='");
+  p += F("<label>Home offset, hours drum</label><input name=offh type=number step=any value='");
   p += String(cfg.offHours, 1);
-  p += F("'><label>Home offset, minutes drum</label><input name=offm type=number step=0.5 value='");
+  p += F("'><label>Home offset, minutes drum</label><input name=offm type=number step=any value='");
   p += String(cfg.offMinutes, 1);
   p += F("'>");
 
-  p += F("<button>Save and restart</button></form>");
+  p += F("<button>Save</button></form>");
 
   p += F("<p class=n><b>Home offset</b> is measured in flaps: how many of them sit "
          "between the magnet and 00. Whole flaps only tell the firmware which "
@@ -169,53 +167,10 @@ static String htmlPage()
   // any cross site request, so a GET endpoint could be fired from a foreign page.
   if (!portalMode)
     p += F("<div class=row>"
-           "<form method=POST action=/scan><button>Scan WiFi</button></form>"
-           "<form method=POST action=/rehome><button>Re-home drums</button></form>"
+           "<form method=POST action=/scan data-ajax><button>Scan WiFi</button></form>"
+           "<form method=POST action=/rehome data-ajax><button>Re-home drums</button></form>"
            "<form method=POST action=/forget><button>Erase settings</button></form>"
            "</div>");
-
-  // The phone pulls the full IANA -> POSIX table and splits it into region and
-  // city, because 450 entries in one dropdown is unusable on a phone. Done in
-  // the browser, not on the board. Without internet - in portal mode, for
-  // instance - the flat preset list stays as it is and keeps the tz name. The
-  // current value is read out of the select, never interpolated into the script.
-  p += F("<script>"
-         "const s=document.getElementById('tz'),pick=document.getElementById('tzpick'),"
-         "reg=document.getElementById('tzregion'),city=document.getElementById('tzcity'),"
-         "val=document.getElementById('tzval'),info=document.getElementById('tzinfo');"
-         "const CUR=s.value,MINE=Intl.DateTimeFormat().resolvedOptions().timeZone;"
-         "let T={};"
-         // Show the local time of the selected zone. IANA names one city per
-         // zone, so the one you live in usually is not on the list - the clock
-         // reading back is what tells you the choice is right.
-         "const note=()=>{val.value=city.value;"
-         "const c=(city.selectedOptions[0]||{}).text||'';"
-         "const z=reg.value==='Other'?c.replace(/ /g,'_'):reg.value+'/'+c.replace(/ /g,'_');"
-         "let s=z.replace(/_/g,' ');"
-         "try{s+=' — '+new Intl.DateTimeFormat([],{timeZone:z,hour:'2-digit',"
-         "minute:'2-digit',timeZoneName:'short'}).format();}catch(e){}"
-         "info.textContent=s+(MINE?'   ·   phone: '+MINE.replace(/_/g,' '):'');};"
-         // many zones share one POSIX string, so select by name, not by value
-         "const cities=(r,name)=>{city.innerHTML='';"
-         "for(const [n,v] of T[r])city.add(new Option(n,v));"
-         "if(name)for(const o of city.options)if(o.text===name){o.selected=true;break;}"
-         "if(city.selectedIndex<0)city.selectedIndex=0;note();};"
-         "reg.onchange=()=>cities(reg.value);city.onchange=note;"
-         "fetch('https://cdn.jsdelivr.net/gh/nayarsystems/posix_tz_db@master/zones.json')"
-         ".then(r=>r.json()).then(z=>{"
-         "for(const k in z){const i=k.indexOf('/');"
-         "const r=i<0?'Other':k.slice(0,i),c=i<0?k:k.slice(i+1);"
-         "(T[r]=T[r]||[]).push([c.replace(/_/g,' '),z[k]]);}"
-         // map the stored string back to a zone name; the factory default is
-         // not a choice, so the phone wins over it
-         "let name=null;for(const k in z)if(z[k]===CUR){name=k;break;}"
-         "if((!name||CUR==='UTC0')&&z[MINE])name=MINE;"
-         "if(!name)name='UTC';"
-         "const i=name.indexOf('/'),r=i<0?'Other':name.slice(0,i);"
-         "for(const g of Object.keys(T).sort())reg.add(new Option(g,g));"
-         "reg.value=r;cities(r,(i<0?name:name.slice(i+1)).replace(/_/g,' '));"
-         "s.removeAttribute('name');s.hidden=true;val.name='tz';pick.hidden=false;"
-         "}).catch(()=>{});</script>");
 
   return p;
 }
@@ -297,9 +252,21 @@ static bool validTz(const String &s)
   return true;
 }
 
+// Whole flaps of offset are bookkeeping, so a correction can be applied to the
+// running count directly - no need to wind the drum to the magnet to see it.
+static void applyOffset(Drum &d, float now)
+{
+  long was = (long)floorf(d.homeOffset), is = (long)floorf(now);
+
+  d.homeOffset = now;
+  d.value = (int)(((d.value - (is - was)) % 60 + 60) % 60);
+}
+
 static void handleSave()
 {
   if (denied()) return;
+
+  const String wasSsid = cfg.ssid, wasPass = cfg.pass;
 
   if (server.hasArg("ssid")) cfg.ssid = server.arg("ssid");
 
@@ -320,17 +287,28 @@ static void handleSave()
 
   saveConfig();
 
-  sendNotice("Saved. Restarting.");
-  delay(500);
-  ESP.restart();
+  // Only the radio needs a restart. Timezone, format and offsets take effect
+  // where they are read, so applying them here keeps the page alive.
+  if (cfg.ssid != wasSsid || cfg.pass != wasPass) {
+    server.send(200, "text/plain", "restart");
+    delay(500);
+    ESP.restart();
+    return;
+  }
+
+  setenv("TZ", cfg.tz.c_str(), 1);
+  tzset();
+  applyOffset(hours,   cfg.offHours);
+  applyOffset(minutes, cfg.offMinutes);
+
+  server.send(200, "text/plain", "ok");
 }
 
 static void handleRehome()
 {
   if (denied()) return;
 
-  server.sendHeader("Location", "/");
-  server.send(303);
+  server.send(200, "text/plain", "ok");
   hours.lastFail = minutes.lastFail = 0;   // an explicit request overrides the backoff
   homeDrum(hours);
   homeDrum(minutes);
@@ -343,8 +321,33 @@ static void handleScan()
   if (denied()) return;
 
   scanNetworks();
-  server.sendHeader("Location", "/");
-  server.send(303);
+  server.send(200, "text/plain", "reload");   // the network list is in the page
+}
+
+// FNV-1a over the asset bodies. Appended to the URLs so a reflashed board is
+// not served a stale script out of the browser cache.
+static uint32_t assetHash()
+{
+  uint32_t h = 2166136261u;
+  for (const char *p = PAGE_CSS; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+  for (const char *p = PAGE_JS;  *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+  for (const char *p = PAGE_JS_FORMS; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+  return h;
+}
+
+static void sendAsset(const char *type, const char *body)
+{
+  server.sendHeader("Cache-Control", "public, max-age=31536000, immutable");
+  server.send(200, type, body);
+}
+
+static void handleCss() { sendAsset("text/css", PAGE_CSS); }
+static void handleJs()
+{
+  server.sendHeader("Cache-Control", "public, max-age=31536000, immutable");
+  server.setContentLength(strlen(PAGE_JS) + strlen(PAGE_JS_FORMS));
+  server.send(200, "application/javascript", PAGE_JS);
+  server.sendContent(PAGE_JS_FORMS);
 }
 
 static void handleNotFound()
@@ -365,6 +368,8 @@ void startServer()
   server.on("/rehome", HTTP_POST, handleRehome);
   server.on("/forget", HTTP_POST, handleForget);
   server.on("/scan", HTTP_POST, handleScan);
+  server.on("/style.css", handleCss);
+  server.on("/app.js", handleJs);
   server.onNotFound(handleNotFound);
   server.begin();
 }

@@ -47,10 +47,7 @@ struct Drum {
 extern Drum hours;
 extern Drum minutes;
 
-int  readHall(int pin);
-void moveFlaps(Drum &d, float flaps);
 bool homeDrum(Drum &d);
-void gotoNumber(Drum &d, int n);
 void showNumber(Drum &d, int n);
 
 // -------------------------------------------------------------- network
