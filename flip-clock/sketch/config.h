@@ -78,4 +78,5 @@ void loadConfig();
 void saveConfig();
 void startServer();
 void startPortal();
+void stopPortal();
 bool connectWiFi();

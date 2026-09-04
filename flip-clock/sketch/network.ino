@@ -51,6 +51,41 @@ static const char *TZ_PRESETS[][2] = {
   {"EET-2EEST,M3.5.0/3,M10.5.0/4",  "Kyiv"},
 };
 
+// Network names are attacker controlled - a neighbour can call their AP
+// anything at all, and it lands straight in our HTML.
+static String esc(const String &s)
+{
+  String o;
+  o.reserve(s.length() + 8);
+
+  for (unsigned i = 0; i < s.length(); i++) {
+    switch (s[i]) {
+      case '&':  o += F("&amp;");  break;
+      case '<':  o += F("&lt;");   break;
+      case '>':  o += F("&gt;");   break;
+      case '"':  o += F("&quot;"); break;
+      case '\'': o += F("&#39;");  break;
+      default:   o += s[i];
+    }
+  }
+  return o;
+}
+
+// Built once when the portal starts. Scanning blocks for seconds and knocks
+// the station link off channel, so it must not happen per request.
+static String netOptions;
+
+static void scanNetworks()
+{
+  int n = WiFi.scanNetworks();
+  netOptions = "";
+
+  for (int i = 0; i < n && i < 15; i++)
+    netOptions += "<option value='" + esc(WiFi.SSID(i)) + "'>";
+
+  WiFi.scanDelete();
+}
+
 static String htmlPage()
 {
   String p = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -62,22 +97,30 @@ static String htmlPage()
                "border:1px solid #444;background:#1c1c1c;color:#eee;font-size:16px}"
                "button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;"
                "background:#e0e0e0;color:#111;font-size:16px;font-weight:600}"
-               "a{color:#7ab7ff}.n{color:#777;font-size:13px;margin-top:16px}"
+               ".row{display:flex;gap:10px;margin-top:16px}"
+               ".row form{flex:1}.row button{margin:0;background:#2a2a2a;color:#ccc;font-weight:400}"
+               ".n{color:#777;font-size:13px;margin-top:16px}"
                "</style><h1>Flip Clock</h1><form method=POST action=/save>");
 
   p += F("<label>WiFi network</label><input name=ssid list=nets value='");
-  p += cfg.ssid;
+  p += esc(cfg.ssid);
   p += F("'><datalist id=nets>");
-
-  int n = WiFi.scanNetworks();
-  for (int i = 0; i < n && i < 15; i++) {
-    p += "<option value='" + WiFi.SSID(i) + "'>";
-  }
+  p += netOptions;
 
   p += F("</datalist><label>Password</label>"
          "<input name=pass type=password placeholder='leave empty to keep current'>");
 
   p += F("<label>Timezone</label><select name=tz id=tz>");
+
+  bool known = false;
+  for (auto &z : TZ_PRESETS) if (cfg.tz == z[0]) known = true;
+
+  // Keep the stored zone in the list even when it came from the full IANA
+  // table, otherwise reloading the page would silently reset it.
+  if (!known) {
+    p += "<option value='" + esc(cfg.tz) + "' selected>" + esc(cfg.tz) + "</option>";
+  }
+
   for (auto &z : TZ_PRESETS) {
     p += "<option value='" + String(z[0]) + "'";
     if (cfg.tz == z[0]) p += " selected";
@@ -104,18 +147,22 @@ static String htmlPage()
          "Running behind means the offset is too small, running ahead means too large. "
          "A new value takes effect on the next homing.</p>");
 
+  // POST, not links: with basic auth the browser would attach credentials to
+  // any cross site request, so a GET endpoint could be fired from a foreign page.
   if (!portalMode)
-    p += F("<p class=n><a href=/rehome>Re-home both drums now</a> &nbsp;·&nbsp; "
-           "<a href=/forget>Erase WiFi and settings</a></p>");
+    p += F("<div class=row>"
+           "<form method=POST action=/rehome><button>Re-home drums</button></form>"
+           "<form method=POST action=/forget><button>Erase settings</button></form>"
+           "</div>");
 
   // The phone pulls the full IANA -> POSIX table and preselects its own zone.
   // Done in the browser, not on the board. Without internet - in portal mode,
-  // for instance - the built in presets above stay as they are.
-  p += "<script>const CUR='" + cfg.tz + "';";
-  p += F("const MINE=Intl.DateTimeFormat().resolvedOptions().timeZone;"
+  // for instance - the built in presets above stay as they are. The current
+  // value is read out of the select, never interpolated into the script.
+  p += F("<script>const s=document.getElementById('tz');const CUR=s.value;"
+         "const MINE=Intl.DateTimeFormat().resolvedOptions().timeZone;"
          "fetch('https://cdn.jsdelivr.net/gh/nayarsystems/posix_tz_db@master/zones.json')"
-         ".then(r=>r.json()).then(z=>{"
-         "const s=document.getElementById('tz');s.innerHTML='';let hit=false;"
+         ".then(r=>r.json()).then(z=>{s.innerHTML='';let hit=false;"
          "for(const k in z){const o=new Option(k,z[k]);"
          "if(z[k]===CUR){o.selected=true;hit=true;}s.add(o);}"
          "if(!hit&&z[MINE])s.value=z[MINE];}).catch(()=>{});</script>");
@@ -137,6 +184,14 @@ static bool denied()
   return true;
 }
 
+static void sendNotice(const char *text)
+{
+  String p = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<body style='font:16px system-ui;background:#111;color:#eee;padding:24px'>");
+  p += text;
+  server.send(200, "text/html", p);
+}
+
 static void handleRoot()
 {
   if (denied()) return;
@@ -152,12 +207,22 @@ static void handleForget()
   prefs.end();
   WiFi.disconnect(true, true);   // also wipes the copy the WiFi stack keeps in NVS
 
-  server.send(200, "text/html",
-              F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-                "<body style='font:16px system-ui;background:#111;color:#eee;padding:24px'>"
-                "Settings erased. Restarting into setup mode."));
+  sendNotice("Settings erased. Restarting into setup mode.");
   delay(500);
   ESP.restart();
+}
+
+// POSIX timezone strings are fed to setenv, and this one also ends up inside
+// the page. Keep it to the characters the format actually uses.
+static bool validTz(const String &s)
+{
+  if (s.length() == 0 || s.length() > 48) return false;
+
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (!isalnum((unsigned char)c) && strchr("+-,./:", c) == nullptr) return false;
+  }
+  return true;
 }
 
 static void handleSave()
@@ -166,18 +231,20 @@ static void handleSave()
 
   if (server.hasArg("ssid")) cfg.ssid = server.arg("ssid");
   if (server.arg("pass").length()) cfg.pass = server.arg("pass");
-  if (server.hasArg("tz"))   cfg.tz = server.arg("tz");
 
-  cfg.fmt12      = server.arg("fmt") == "12";
-  cfg.offHours   = server.arg("offh").toFloat();
-  cfg.offMinutes = server.arg("offm").toFloat();
+  if (server.hasArg("tz")) {
+    String tz = server.arg("tz");
+    if (!validTz(tz)) { sendNotice("Bad timezone string."); return; }
+    cfg.tz = tz;
+  }
+
+  if (server.hasArg("fmt"))  cfg.fmt12      = server.arg("fmt") == "12";
+  if (server.hasArg("offh")) cfg.offHours   = server.arg("offh").toFloat();
+  if (server.hasArg("offm")) cfg.offMinutes = server.arg("offm").toFloat();
 
   saveConfig();
 
-  server.send(200, "text/html",
-              F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-                "<body style='font:16px system-ui;background:#111;color:#eee;padding:24px'>"
-                "Saved. Restarting."));
+  sendNotice("Saved. Restarting.");
   delay(500);
   ESP.restart();
 }
@@ -198,23 +265,42 @@ void startServer()
 {
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/rehome", handleRehome);
-  server.on("/forget", handleForget);
+  server.on("/rehome", HTTP_POST, handleRehome);
+  server.on("/forget", HTTP_POST, handleForget);
   server.onNotFound(handleRoot);      // captive portal: anything lands on the form
   server.begin();
 }
 
+// AP_STA, not AP: the portal is up for setup, but the station side keeps
+// retrying underneath. A router that was simply down at boot will be picked
+// up on its own, without anyone walking over with a phone.
 void startPortal()
 {
   portalMode = true;
 
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_NAME, AP_PASS);      // WPA2, so the typed in password is not broadcast
   dns.start(53, "*", WiFi.softAPIP());
+
+  scanNetworks();
+  if (cfg.ssid.length()) WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+
   startServer();
 
   Serial.printf("portal: connect to \"%s\" with password \"%s\", open http://%s\n",
                 AP_NAME, AP_PASS, WiFi.softAPIP().toString().c_str());
+}
+
+void stopPortal()
+{
+  if (!portalMode) return;
+
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalMode = false;
+
+  Serial.println("portal closed");
 }
 
 bool connectWiFi()

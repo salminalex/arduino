@@ -82,10 +82,12 @@ void gotoNumber(Drum &d, int n)
   d.value = n;
 }
 
-// Homing at 00 instead of stepping there: re-references the drum against the
-// magnet once an hour, so nothing can accumulate.
+// Re-reference against the magnet whenever the number wraps, instead of
+// stepping blindly around: nothing accumulates, and in 12 hour mode - where 0
+// never comes up and 12 -> 1 would otherwise mean 49 flaps - the drum takes
+// the short way through the magnet.
 void showNumber(Drum &d, int n)
 {
-  if (n == 0) homeDrum(d);
-  else        gotoNumber(d, n);
+  if (n <= d.value) homeDrum(d);
+  if (n != 0)       gotoNumber(d, n);
 }

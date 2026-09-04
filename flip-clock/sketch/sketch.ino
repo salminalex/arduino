@@ -27,40 +27,64 @@ DNSServer   dns;
 Preferences prefs;
 bool        portalMode = false;
 
-void setup()
+static bool running = false;   // NTP answered and the drums know where they are
+
+// Runs once the station link is up, whether that happened at boot or hours
+// later, when a router that was down finally came back.
+static void startClock()
 {
-  Serial.begin(115200);
-  delay(300);
-  analogReadResolution(12);
-
-  loadConfig();
-
-  if (!connectWiFi()) {
-    startPortal();
-    return;
-  }
-
   Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+
+  stopPortal();
   MDNS.begin("flipclock");
-  startServer();
+  MDNS.addService("http", "tcp", 80);
 
   configTzTime(cfg.tz.c_str(), "pool.ntp.org", "time.nist.gov");
 
   struct tm t;
+  uint32_t start = millis();
   Serial.print("NTP");
-  while (!getLocalTime(&t)) { delay(500); Serial.print('.'); }
-  Serial.printf("\ntime %02d:%02d\n", t.tm_hour, t.tm_min);
+  while (!getLocalTime(&t) && millis() - start < 20000) { delay(500); Serial.print('.'); }
+  Serial.println();
+
+  if (!getLocalTime(&t)) return;   // no time yet, loop will call again
+  Serial.printf("time %02d:%02d\n", t.tm_hour, t.tm_min);
 
   homeDrum(hours);
   homeDrum(minutes);
+  running = true;
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(300);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_HALL_HOURS,   ADC_11db);   // full 0..3.3V span
+  analogSetPinAttenuation(PIN_HALL_MINUTES, ADC_11db);
+
+  loadConfig();
+
+  if (connectWiFi()) {
+    startServer();
+    startClock();
+  } else {
+    startPortal();      // keeps retrying the station link in the background
+  }
 }
 
 void loop()
 {
   server.handleClient();
+  if (portalMode) dns.processNextRequest();
 
-  if (portalMode) {
-    dns.processNextRequest();
+  if (!running) {
+    static uint32_t lastTry = 0;
+    if (WiFi.status() == WL_CONNECTED && millis() - lastTry > 5000) {
+      lastTry = millis();
+      startClock();
+    }
     return;
   }
 
