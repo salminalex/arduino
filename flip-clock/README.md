@@ -37,7 +37,8 @@ hours cable needs individual leads.
 | `sketch/sketch.ino` | globals, `setup`, `loop` |
 | `sketch/hardware.ino` | steppers, hall sensors, homing |
 | `sketch/network.ino` | WiFi, portal, settings page, NVS |
-| `sketch/config.h` | pins, tuning constants, passwords |
+| `sketch/config.h` | pins, tuning constants |
+| `sketch/secrets.h` | passwords, gitignored — copy from `secrets.h.example` |
 
 Needs the `AccelStepper` library. Everything else ships with the ESP32 core.
 
@@ -48,13 +49,17 @@ Needs the `AccelStepper` library. Everything else ships with the ESP32 core.
 3. Pick your network, timezone and 12/24 hour format, save
 4. The clock reboots, homes both drums and starts running
 
-Afterwards the same page lives at the board IP or `http://flipclock.local`,
-behind a login. On a network with internet the timezone list expands to the
-full IANA set and preselects the zone your phone is in.
+Afterwards the same page lives at the board IP or at
+[http://flipclock.local](http://flipclock.local), behind a login. On a network
+with internet the timezone picker expands into region and city dropdowns
+covering the full IANA set, and preselects the zone your phone is in.
 
-**Change `AP_PASS`, `UI_USER` and `UI_PASS` in `config.h` before the clock
-leaves the house.** The portal is where the password of your real network gets
-typed in, and WPA2 is what keeps it off the air.
+Before the first build, copy `sketch/secrets.h.example` to `sketch/secrets.h`
+and put your own values in — the portal passphrase and the login for the
+settings page. That file is gitignored; the repository never sees it.
+
+The portal is where the password of your real network gets typed in, and WPA2
+is what keeps it off the air, so don't leave the example values in place.
 
 ## Calibration
 
@@ -62,10 +67,14 @@ Homing finds the *peak* of the hall reading, which is the physical centre of
 the magnet. The home offset then says how many flaps sit between that centre
 and 00 — the board cannot know this, since it never sees the printed digits.
 
-One flap = 34 motor steps = 6° of drum rotation. Halves are allowed.
+One flap = 34 motor steps = 6° of drum rotation. Whole flaps are bookkeeping —
+they only tell the firmware which number the magnet sits under, so the drum
+never reverses and never winds most of a turn to reach 00. A fraction is a real
+move: 0.5 nudges the drum by 17 steps.
 
-Press **Re-home drums** on the settings page and look at the window: it should
-read 00. Shows 59, add 1. Shows 01, subtract 1. Values live in NVS and survive
+The settings page prints what the firmware currently believes each drum shows.
+Compare that with the window and add the difference to the offset: window one
+lower, add 1; one higher, subtract 1. Values live in NVS and survive
 reflashing.
 
 If the error *grows* over an hour and resets on the hour, the offset is not the

@@ -22,27 +22,36 @@ void moveFlaps(Drum &d, float flaps)
   d.stepper.disableOutputs();   // drop the coil current, the motor would cook otherwise
 }
 
-void homeDrum(Drum &d)
+static bool homeFailed(Drum &d, const char *why)
 {
+  d.stepper.disableOutputs();
+  d.lastFail = millis();
+  Serial.printf("[!] %s: %s, ADC=%d\n", d.name, why, readHall(d.pin));
+  return false;
+}
+
+bool homeDrum(Drum &d)
+{
+  // A drum that just failed is not worth winding around again every couple of
+  // seconds - the sensor is not going to have healed in the meantime.
+  if (d.lastFail && millis() - d.lastFail < HOME_RETRY_MS) return false;
+
   d.stepper.setMaxSpeed(SPEED);
   d.stepper.setSpeed(d.dir * SPEED);
 
   long guard = 0;
 
   // already sitting on the magnet - step off it first
-  while (readHall(d.pin) >= HALL_TRIP && guard < 3072) {
+  while (readHall(d.pin) >= HALL_TRIP) {
     if (d.stepper.runSpeed()) guard++;
+    if (guard > HOME_SCAN_LIMIT) return homeFailed(d, "sensor stuck high");
   }
 
   // drive until the magnet shows up
   guard = 0;
   while (readHall(d.pin) < HALL_TRIP) {
     if (d.stepper.runSpeed()) guard++;
-    if (guard > 3072) {                      // one and a half revolutions, no magnet
-      d.stepper.disableOutputs();
-      Serial.printf("[!] %s: magnet not found, ADC=%d\n", d.name, readHall(d.pin));
-      return;
-    }
+    if (guard > HOME_SCAN_LIMIT) return homeFailed(d, "magnet not found");
   }
 
   // cross the magnet and remember where the reading peaked - that is its centre,
@@ -52,9 +61,10 @@ void homeDrum(Drum &d)
   long width   = 0;
   int  v;
 
-  while ((v = readHall(d.pin)) >= HALL_TRIP && width < 3072) {
+  while ((v = readHall(d.pin)) >= HALL_TRIP) {
     if (v > peak) { peak = v; peakPos = d.stepper.currentPosition(); }
     if (d.stepper.runSpeed()) width++;
+    if (width > HOME_SCAN_LIMIT) return homeFailed(d, "sensor never released");
   }
 
   // back up into the peak
@@ -65,15 +75,25 @@ void homeDrum(Drum &d)
   d.stepper.disableOutputs();
   d.stepper.setCurrentPosition(0);
   d.target = 0;
-  d.value  = 0;
+  d.lastFail = 0;
 
-  if (d.homeOffset != 0) {
-    moveFlaps(d, d.homeOffset);
+  // The offset is applied as bookkeeping, not as motion: whole flaps just say
+  // which number the magnet sits under, so the drum never has to reverse or
+  // wind most of a revolution to reach 00. Only the sub-flap remainder is a
+  // real move, and that one is always forward and shorter than one flap.
+  long  whole = (long)floorf(d.homeOffset);
+  float frac  = d.homeOffset - whole;
+
+  d.value = (int)(((-whole) % 60 + 60) % 60);
+  if (frac > 0.001f) {
+    moveFlaps(d, frac);
     d.stepper.setCurrentPosition(0);
     d.target = 0;
   }
 
-  Serial.printf("%s: homed, peak %d over %ld steps\n", d.name, peak, width);
+  Serial.printf("%s: homed, peak %d over %ld steps, showing %d\n",
+                d.name, peak, width, d.value);
+  return true;
 }
 
 void gotoNumber(Drum &d, int n)
@@ -86,8 +106,12 @@ void gotoNumber(Drum &d, int n)
 // stepping blindly around: nothing accumulates, and in 12 hour mode - where 0
 // never comes up and 12 -> 1 would otherwise mean 49 flaps - the drum takes
 // the short way through the magnet.
+//
+// If homing fails the drum position is unknown, so moving would only smear the
+// error further. Better to sit still and keep complaining on the serial port.
 void showNumber(Drum &d, int n)
 {
-  if (n <= d.value) homeDrum(d);
-  if (n != 0)       gotoNumber(d, n);
+  if (n <= d.value && !homeDrum(d)) return;
+
+  gotoNumber(d, n);
 }

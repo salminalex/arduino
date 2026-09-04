@@ -3,7 +3,8 @@
  *
  * hardware.ino - steppers, hall sensors, homing
  * network.ino  - WiFi, setup portal, settings page, NVS
- * config.h     - pins, tuning constants, passwords
+ * config.h     - pins and tuning constants
+ * secrets.h    - passwords, gitignored, copy from secrets.h.example
  *
  * No stored network, or it does not come up: the board starts an access point
  * called FlipClock and serves the settings page at 192.168.4.1 as a captive
@@ -18,8 +19,8 @@
 AccelStepper stepperHours   = AccelStepper(AccelStepper::FULL4WIRE, 13, 14, 12, 27);
 AccelStepper stepperMinutes = AccelStepper(AccelStepper::FULL4WIRE, 26, 33, 25, 32);
 
-Drum hours   = {stepperHours,   PIN_HALL_HOURS,   DIR_HOURS,   0, 0, 0, "hours"};
-Drum minutes = {stepperMinutes, PIN_HALL_MINUTES, DIR_MINUTES, 0, 0, 0, "minutes"};
+Drum hours   = {stepperHours,   PIN_HALL_HOURS,   DIR_HOURS,   0, 0, 0, "hours",   0};
+Drum minutes = {stepperMinutes, PIN_HALL_MINUTES, DIR_MINUTES, 0, 0, 0, "minutes", 0};
 
 Config      cfg;
 WebServer   server(80);
@@ -27,11 +28,12 @@ DNSServer   dns;
 Preferences prefs;
 bool        portalMode = false;
 
-static bool running = false;   // NTP answered and the drums know where they are
+static bool stationReady = false;   // mDNS and SNTP set up for this link
+static bool running      = false;   // NTP answered and the drums know where they are
 
 // Runs once the station link is up, whether that happened at boot or hours
 // later, when a router that was down finally came back.
-static void startClock()
+static void startStation()
 {
   Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -40,19 +42,7 @@ static void startClock()
   MDNS.addService("http", "tcp", 80);
 
   configTzTime(cfg.tz.c_str(), "pool.ntp.org", "time.nist.gov");
-
-  struct tm t;
-  uint32_t start = millis();
-  Serial.print("NTP");
-  while (!getLocalTime(&t) && millis() - start < 20000) { delay(500); Serial.print('.'); }
-  Serial.println();
-
-  if (!getLocalTime(&t)) return;   // no time yet, loop will call again
-  Serial.printf("time %02d:%02d\n", t.tm_hour, t.tm_min);
-
-  homeDrum(hours);
-  homeDrum(minutes);
-  running = true;
+  stationReady = true;
 }
 
 void setup()
@@ -68,7 +58,7 @@ void setup()
 
   if (connectWiFi()) {
     startServer();
-    startClock();
+    startStation();
   } else {
     startPortal();      // keeps retrying the station link in the background
   }
@@ -80,11 +70,18 @@ void loop()
   if (portalMode) dns.processNextRequest();
 
   if (!running) {
-    static uint32_t lastTry = 0;
-    if (WiFi.status() == WL_CONNECTED && millis() - lastTry > 5000) {
-      lastTry = millis();
-      startClock();
-    }
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (!stationReady) startStation();
+
+    // Poll without blocking. On a network that never reaches an NTP server -
+    // a captive portal at the office, say - the page has to stay responsive.
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return;
+
+    Serial.printf("time %02d:%02d\n", t.tm_hour, t.tm_min);
+    homeDrum(hours);
+    homeDrum(minutes);
+    running = true;
     return;
   }
 

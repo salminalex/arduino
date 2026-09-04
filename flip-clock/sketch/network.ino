@@ -88,7 +88,10 @@ static void scanNetworks()
 
 static String htmlPage()
 {
-  String p = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  String p;
+  p.reserve(7000);   // the page is ~5 KB, and it is grown in small pieces
+
+  p += F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
                "<title>Flip Clock</title><style>"
                "body{font:16px system-ui;margin:0;padding:24px;background:#111;color:#eee}"
                "h1{font-size:20px;margin:0 0 20px}"
@@ -98,7 +101,11 @@ static String htmlPage()
                "button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;"
                "background:#e0e0e0;color:#111;font-size:16px;font-weight:600}"
                ".row{display:flex;gap:10px;margin-top:16px}"
+               ".tzrow{display:flex;gap:10px}.tzrow select:first-child{flex:0 0 38%}"
+               ".tzrow select:last-child{flex:1;min-width:0}"
                ".row form{flex:1}.row button{margin:0;background:#2a2a2a;color:#ccc;font-weight:400}"
+               ".chk{display:flex;align-items:center;gap:8px;margin-top:10px}"
+               ".chk input{width:auto}"
                ".n{color:#777;font-size:13px;margin-top:16px}"
                "</style><h1>Flip Clock</h1><form method=POST action=/save>");
 
@@ -108,9 +115,14 @@ static String htmlPage()
   p += netOptions;
 
   p += F("</datalist><label>Password</label>"
-         "<input name=pass type=password placeholder='leave empty to keep current'>");
+         "<input name=pass type=password placeholder='leave empty to keep current'>"
+         "<label class=chk><input type=checkbox name=nopass>open network, no password</label>");
 
-  p += F("<label>Timezone</label><select name=tz id=tz>");
+  p += F("<label>Timezone</label>"
+         "<div class=tzrow id=tzpick hidden>"
+         "<select id=tzregion></select><select id=tzcity></select></div>"
+         "<input type=hidden id=tzval>"
+         "<select name=tz id=tz>");
 
   bool known = false;
   for (auto &z : TZ_PRESETS) if (cfg.tz == z[0]) known = true;
@@ -126,7 +138,7 @@ static String htmlPage()
     if (cfg.tz == z[0]) p += " selected";
     p += ">" + String(z[1]) + "</option>";
   }
-  p += F("</select>");
+  p += F("</select><div class=n id=tzinfo></div>");
 
   p += F("<label>Time format</label><select name=fmt>");
   p += cfg.fmt12 ? F("<option value=24>24 hour</option><option value=12 selected>12 hour</option>")
@@ -139,33 +151,71 @@ static String htmlPage()
   p += String(cfg.offMinutes, 1);
   p += F("'>");
 
-  p += F("<button>Save and restart</button></form>"
-         "<p class=n><b>Home offset</b> is measured in flaps: how many of them sit "
-         "between the magnet and 00. One flap = 34 motor steps = 6 degrees of drum "
-         "rotation. Halves are allowed, 0.5 shifts the drum by 17 steps.<br><br>"
-         "After homing the drum must show 00. Shows 59 - add 1. Shows 01 - subtract 1. "
-         "Running behind means the offset is too small, running ahead means too large. "
-         "A new value takes effect on the next homing.</p>");
+  p += F("<button>Save and restart</button></form>");
+
+  p += F("<p class=n><b>Home offset</b> is measured in flaps: how many of them sit "
+         "between the magnet and 00. Whole flaps only tell the firmware which "
+         "number the magnet sits under, so the drum never reverses or winds most "
+         "of a turn. A fraction is a real move: 0.5 nudges the drum 17 steps.<br><br>"
+         "To calibrate, compare the window with what the firmware thinks and add "
+         "the difference. Firmware says <b>hours ");
+  p += String(hours.value);
+  p += F(", minutes ");
+  p += String(minutes.value);
+  p += F("</b> right now. Window one lower than that - add 1, one higher - "
+         "subtract 1. Takes effect on the next homing.</p>");
 
   // POST, not links: with basic auth the browser would attach credentials to
   // any cross site request, so a GET endpoint could be fired from a foreign page.
   if (!portalMode)
     p += F("<div class=row>"
+           "<form method=POST action=/scan><button>Scan WiFi</button></form>"
            "<form method=POST action=/rehome><button>Re-home drums</button></form>"
            "<form method=POST action=/forget><button>Erase settings</button></form>"
            "</div>");
 
-  // The phone pulls the full IANA -> POSIX table and preselects its own zone.
-  // Done in the browser, not on the board. Without internet - in portal mode,
-  // for instance - the built in presets above stay as they are. The current
-  // value is read out of the select, never interpolated into the script.
-  p += F("<script>const s=document.getElementById('tz');const CUR=s.value;"
-         "const MINE=Intl.DateTimeFormat().resolvedOptions().timeZone;"
+  // The phone pulls the full IANA -> POSIX table and splits it into region and
+  // city, because 450 entries in one dropdown is unusable on a phone. Done in
+  // the browser, not on the board. Without internet - in portal mode, for
+  // instance - the flat preset list stays as it is and keeps the tz name. The
+  // current value is read out of the select, never interpolated into the script.
+  p += F("<script>"
+         "const s=document.getElementById('tz'),pick=document.getElementById('tzpick'),"
+         "reg=document.getElementById('tzregion'),city=document.getElementById('tzcity'),"
+         "val=document.getElementById('tzval'),info=document.getElementById('tzinfo');"
+         "const CUR=s.value,MINE=Intl.DateTimeFormat().resolvedOptions().timeZone;"
+         "let T={};"
+         // Show the local time of the selected zone. IANA names one city per
+         // zone, so the one you live in usually is not on the list - the clock
+         // reading back is what tells you the choice is right.
+         "const note=()=>{val.value=city.value;"
+         "const c=(city.selectedOptions[0]||{}).text||'';"
+         "const z=reg.value==='Other'?c.replace(/ /g,'_'):reg.value+'/'+c.replace(/ /g,'_');"
+         "let s=z.replace(/_/g,' ');"
+         "try{s+=' — '+new Intl.DateTimeFormat([],{timeZone:z,hour:'2-digit',"
+         "minute:'2-digit',timeZoneName:'short'}).format();}catch(e){}"
+         "info.textContent=s+(MINE?'   ·   phone: '+MINE.replace(/_/g,' '):'');};"
+         // many zones share one POSIX string, so select by name, not by value
+         "const cities=(r,name)=>{city.innerHTML='';"
+         "for(const [n,v] of T[r])city.add(new Option(n,v));"
+         "if(name)for(const o of city.options)if(o.text===name){o.selected=true;break;}"
+         "if(city.selectedIndex<0)city.selectedIndex=0;note();};"
+         "reg.onchange=()=>cities(reg.value);city.onchange=note;"
          "fetch('https://cdn.jsdelivr.net/gh/nayarsystems/posix_tz_db@master/zones.json')"
-         ".then(r=>r.json()).then(z=>{s.innerHTML='';let hit=false;"
-         "for(const k in z){const o=new Option(k,z[k]);"
-         "if(z[k]===CUR){o.selected=true;hit=true;}s.add(o);}"
-         "if(!hit&&z[MINE])s.value=z[MINE];}).catch(()=>{});</script>");
+         ".then(r=>r.json()).then(z=>{"
+         "for(const k in z){const i=k.indexOf('/');"
+         "const r=i<0?'Other':k.slice(0,i),c=i<0?k:k.slice(i+1);"
+         "(T[r]=T[r]||[]).push([c.replace(/_/g,' '),z[k]]);}"
+         // map the stored string back to a zone name; the factory default is
+         // not a choice, so the phone wins over it
+         "let name=null;for(const k in z)if(z[k]===CUR){name=k;break;}"
+         "if((!name||CUR==='UTC0')&&z[MINE])name=MINE;"
+         "if(!name)name='UTC';"
+         "const i=name.indexOf('/'),r=i<0?'Other':name.slice(0,i);"
+         "for(const g of Object.keys(T).sort())reg.add(new Option(g,g));"
+         "reg.value=r;cities(r,(i<0?name:name.slice(i+1)).replace(/_/g,' '));"
+         "s.removeAttribute('name');s.hidden=true;val.name='tz';pick.hidden=false;"
+         "}).catch(()=>{});</script>");
 
   return p;
 }
@@ -175,8 +225,25 @@ static String htmlPage()
 // In the portal the WPA2 passphrase is the gate already, and a login prompt
 // there tends to confuse captive portal browsers. On a real network anyone
 // could reach the page, so ask for credentials.
+// Basic auth alone does not stop a cross site POST: a foreign page can submit
+// a form here and the browser attaches the credentials by itself. A form post
+// from somewhere else carries that origin in Origin or Referer.
+static bool crossSite()
+{
+  String from = server.header("Origin");
+  if (from.length() == 0) from = server.header("Referer");
+  if (from.length() == 0) return false;    // curl and friends, no browser context
+
+  return from.indexOf(server.hostHeader()) < 0;
+}
+
 static bool denied()
 {
+  if (server.method() == HTTP_POST && crossSite()) {
+    server.send(403, "text/plain", "cross site request blocked");
+    return true;
+  }
+
   if (portalMode) return false;
   if (server.authenticate(UI_USER, UI_PASS)) return false;
 
@@ -187,8 +254,10 @@ static bool denied()
 static void sendNotice(const char *text)
 {
   String p = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<body style='font:16px system-ui;background:#111;color:#eee;padding:24px'>");
+               "<title>Flip Clock</title>"
+               "<body style='font:16px system-ui;background:#111;color:#eee;padding:24px'><p>");
   p += text;
+  p += F("</p></body>");
   server.send(200, "text/html", p);
 }
 
@@ -220,7 +289,10 @@ static bool validTz(const String &s)
 
   for (unsigned i = 0; i < s.length(); i++) {
     char c = s[i];
-    if (!isalnum((unsigned char)c) && strchr("+-,./:", c) == nullptr) return false;
+    // <> are part of the format: modern tzdata writes numeric abbreviations
+    // that way, as in "<+05>-5" for Almaty. Safe here, since the string is
+    // escaped on output and never reaches the script.
+    if (!isalnum((unsigned char)c) && strchr("+-,./:<>", c) == nullptr) return false;
   }
   return true;
 }
@@ -230,7 +302,11 @@ static void handleSave()
   if (denied()) return;
 
   if (server.hasArg("ssid")) cfg.ssid = server.arg("ssid");
-  if (server.arg("pass").length()) cfg.pass = server.arg("pass");
+
+  // An empty password field means "keep the current one", so clearing it needs
+  // its own switch - otherwise moving to an open network is impossible.
+  if (server.hasArg("nopass"))          cfg.pass = "";
+  else if (server.arg("pass").length()) cfg.pass = server.arg("pass");
 
   if (server.hasArg("tz")) {
     String tz = server.arg("tz");
@@ -255,19 +331,41 @@ static void handleRehome()
 
   server.sendHeader("Location", "/");
   server.send(303);
+  hours.lastFail = minutes.lastFail = 0;   // an explicit request overrides the backoff
   homeDrum(hours);
   homeDrum(minutes);
+}
+
+// On a working network the list is not refreshed per request - scanning blocks
+// for seconds and drops the link off channel. Do it when asked instead.
+static void handleScan()
+{
+  if (denied()) return;
+
+  scanNetworks();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+static void handleNotFound()
+{
+  if (portalMode) { handleRoot(); return; }   // captive portal: everything is the form
+  server.send(404, "text/plain", "not found");
 }
 
 // ---------------------------------------------------------------- setup
 
 void startServer()
 {
+  static const char *csrfHeaders[] = {"Origin", "Referer"};
+  server.collectHeaders(csrfHeaders, 2);
+
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/rehome", HTTP_POST, handleRehome);
   server.on("/forget", HTTP_POST, handleForget);
-  server.onNotFound(handleRoot);      // captive portal: anything lands on the form
+  server.on("/scan", HTTP_POST, handleScan);
+  server.onNotFound(handleNotFound);
   server.begin();
 }
 
